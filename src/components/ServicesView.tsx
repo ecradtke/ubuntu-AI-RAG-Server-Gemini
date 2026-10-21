@@ -78,11 +78,14 @@ export const ServicesView: React.FC<ServicesViewProps> = ({
         ];
       case 'rss':
         return [
-          `systemd[1]: Triggered k13-rss-sync.timer.`,
-          `k13-rss-sync: Connecting to FreshRSS NAS API (user: admin)...`,
-          `k13-rss-sync: Fetched 38 new articles since last sync.`,
+          `systemd[1]: Triggered k13-rss-sync.timer (every 5 minutes).`,
+          `k13-rss-sync: Authenticated to FreshRSS API at http://nas.local:8080/api/greader.php`,
+          `k13-rss-sync: Queried unread stream (xt=user/-/state/com.google/read): retrieved 24 unread items.`,
+          `k13-rss-sync: [✓] Exported 24 unread items to PostgreSQL 'fetch42.articles'.`,
           `k13-rss-sync: Generating 768-dim embeddings via Intel NPU (:11434/api/embed)...`,
-          `k13-rss-sync: Upserted 38 points to Qdrant collection 'rss_articles'.`,
+          `k13-rss-sync: Upserted 24 vector points to Qdrant collection 'rss_articles'.`,
+          `k13-rss-sync: Updated PostgreSQL vector_indexed = TRUE.`,
+          `k13-rss-sync: [✓] Called FreshRSS edit-tag (a=user/-/state/com.google/read) -> Marked 24 articles as READ in FreshRSS server.`,
           `systemd[1]: k13-rss-sync.service: Deactivated successfully.`
         ];
       default:

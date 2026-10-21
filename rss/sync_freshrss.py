@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Sync FreshRSS -> PostgreSQL -> OpenVINO Embeddings (NPU) -> Qdrant.
+"""Sync FreshRSS -> PostgreSQL -> OpenVINO Embeddings (Intel NPU) -> Qdrant.
 
-Automatically detects PostgreSQL tables across all schemas, dynamically adapts
-to whatever columns exist in the articles table (title, url/link, feed/source,
-category/group, published_at/date, content/summary), detects if Qdrant is empty
-or missing, auto-creates public.articles if needed, resets vector_indexed,
-and continuously embeds unindexed articles via OpenVINO into Qdrant.
+Pipeline Workflow:
+  1. Connects to the FreshRSS Server API (Google Reader compatible API).
+  2. Queries all UNREAD messages using `xt=user/-/state/com.google/read`.
+  3. Exports the unread messages to the PostgreSQL database with vector_indexed=FALSE
+     and tracks their FreshRSS item IDs.
+  4. Generates dense vector embeddings via OpenVINO on Intel NPU (bge-base 768d)
+     and upserts points into Qdrant collection 'rss_articles'.
+  5. Updates PostgreSQL records to vector_indexed=TRUE.
+  6. AFTER successful embedding and Qdrant ingestion, calls the FreshRSS API
+     (`/reader/api/0/edit-tag` with `a=user/-/state/com.google/read`) to mark the
+     processed articles as READ in the FreshRSS server.
 """
 
 import os
@@ -14,7 +20,7 @@ import time
 import uuid
 import re
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import requests
 import psycopg2
@@ -28,21 +34,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("k13-rss-sync")
 
-# Environment & Config
-QDRANT_URL = os.environ.get("QDRANT_URL", "http://127.0.0.1:6333")
-QDRANT_COLLECTION = os.environ.get("QDRANT_COLLECTION", "rss_articles")
-
-EMBEDDING_HOST = os.environ.get("EMBEDDING_HOST", "http://127.0.0.1:11434")
-EMBED_MODEL = os.environ.get("EMBED_MODEL", "BAAI/bge-base-en-v1.5")
-EMBED_DIMS = int(os.environ.get("EMBED_DIMS", "768"))
-if "small" in EMBED_MODEL:
-    EMBED_DIMS = 384
 
 # Fallback: directly parse .env if present so python sees variables even without wrapper
 def _load_env_file():
     candidates = [
         os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"),
         "/opt/fetch42/.env",
+        "/opt/k13/.env",
         ".env"
     ]
     for path in candidates:
@@ -65,6 +63,7 @@ def _load_env_file():
 
 _load_env_file()
 
+
 def get_env_opt(*keys: str, default: str = "") -> str:
     for k in keys:
         v = (os.environ.get(k) or "").strip()
@@ -72,6 +71,22 @@ def get_env_opt(*keys: str, default: str = "") -> str:
             return v
     return default
 
+
+# Qdrant configuration
+qdrant_host = get_env_opt("QDRANT_HOST", default="127.0.0.1")
+qdrant_port = get_env_opt("QDRANT_PORT", default="6333")
+QDRANT_URL = get_env_opt("QDRANT_URL", default=f"http://{qdrant_host}:{qdrant_port}")
+QDRANT_COLLECTION = get_env_opt("QDRANT_COLLECTION", default="rss_articles")
+
+# OpenVINO Embeddings configuration (Intel NPU)
+ov_port = get_env_opt("OV_PORT", default="11434")
+EMBEDDING_HOST = get_env_opt("EMBEDDING_HOST", "OLLAMA_HOST", default=f"http://127.0.0.1:{ov_port}").rstrip("/")
+EMBED_MODEL = get_env_opt("EMBED_MODEL", default="BAAI/bge-base-en-v1.5")
+EMBED_DIMS = int(get_env_opt("EMBED_DIMS", default="768"))
+if "small" in EMBED_MODEL:
+    EMBED_DIMS = 384
+
+# PostgreSQL configuration (NAS metadata store)
 PG_HOST = get_env_opt("PG_HOST", "POSTGRES_HOST", "NAS_HOST", "NAS_IP", "DB_HOST", default="127.0.0.1")
 PG_PORT = int(get_env_opt("PG_PORT", "POSTGRES_PORT", default="5432"))
 PG_USER = get_env_opt("PG_USER", "POSTGRES_USER", "DB_USER", default="freshrss")
@@ -83,12 +98,242 @@ PG_PASSWORD = get_env_opt(
 )
 PG_DBNAME = get_env_opt("PG_DB", "PG_DBNAME", "POSTGRES_DB", default="fetch42")
 
+# FreshRSS Server API configuration (Google Reader compatible API)
 FRESHRSS_BASE_URL = get_env_opt("FRESHRSS_BASE_URL", "FRESHRSS_URL", default="").rstrip("/")
 if not FRESHRSS_BASE_URL and PG_HOST != "127.0.0.1":
     FRESHRSS_BASE_URL = f"http://{PG_HOST}:8080"
 FRESHRSS_USER = get_env_opt("FRESHRSS_USER", default="")
 FRESHRSS_API_PASS = get_env_opt("FRESHRSS_API_PASS", "FRESHRSS_PASSWORD", default="")
 
+
+# ==============================================================================
+# FreshRSS Google Reader API Implementation
+# ==============================================================================
+
+def normalize_greader_url_candidates(base_url: str) -> List[str]:
+    """Generates candidate API base endpoints for FreshRSS Google Reader API."""
+    clean = base_url.rstrip("/")
+    if not clean:
+        return []
+    if clean.endswith("/api/greader.php") or clean.endswith("/greader.php"):
+        return [clean]
+    return [
+        f"{clean}/api/greader.php",
+        f"{clean}/p/api/greader.php",
+        clean
+    ]
+
+
+def freshrss_login(base_url: str, user: str, password: str) -> Tuple[Optional[str], Optional[str]]:
+    """Authenticates against FreshRSS Google Reader ClientLogin endpoint.
+    Returns (working_api_base_url, auth_token).
+    """
+    if not base_url or not user or not password:
+        logger.warning("FreshRSS credentials or URL missing. Skipping FreshRSS API sync.")
+        return None, None
+
+    candidates = normalize_greader_url_candidates(base_url)
+    for api_base in candidates:
+        login_url = f"{api_base}/accounts/ClientLogin"
+        try:
+            r = requests.post(
+                login_url,
+                data={"Email": user, "Passwd": password},
+                params={"output": "json"},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=12
+            )
+            if r.status_code == 200:
+                # 1. Parse JSON response if returned
+                try:
+                    j = r.json()
+                    if "Auth" in j and j["Auth"]:
+                        logger.info(f"[✓] FreshRSS authentication successful at {login_url}")
+                        return api_base, str(j["Auth"]).strip()
+                except Exception:
+                    pass
+
+                # 2. Parse plain text 'Auth=...' format
+                for line in r.text.splitlines():
+                    if line.startswith("Auth="):
+                        auth_token = line.split("Auth=", 1)[1].strip()
+                        if auth_token:
+                            logger.info(f"[✓] FreshRSS authentication successful at {login_url}")
+                            return api_base, auth_token
+        except Exception as e:
+            logger.debug(f"Candidate {login_url} failed: {e}")
+
+    logger.warning(f"Could not authenticate to FreshRSS at {base_url} (checked: {candidates})")
+    return None, None
+
+
+def get_freshrss_action_token(api_base: str, auth_token: str) -> Optional[str]:
+    """Retrieves Google Reader CSRF action token 'T' required for edit-tag (mark as read)."""
+    if not api_base or not auth_token:
+        return None
+    token_url = f"{api_base}/reader/api/0/token"
+    try:
+        r = requests.get(
+            token_url,
+            headers={"Authorization": f"GoogleLogin auth={auth_token}"},
+            timeout=10
+        )
+        if r.status_code == 200:
+            token = r.text.strip()
+            if token:
+                return token
+    except Exception as e:
+        logger.warning(f"Failed to fetch FreshRSS action token from {token_url}: {e}")
+    return None
+
+
+def fetch_unread_freshrss_articles(api_base: str, auth_token: str, limit: int = 150, max_pages: int = 10) -> List[Dict[str, Any]]:
+    """Fetches ALL UNREAD items from FreshRSS using `xt=user/-/state/com.google/read`
+    with pagination support.
+    """
+    if not api_base or not auth_token:
+        return []
+
+    url = f"{api_base}/reader/api/0/stream/contents/reading-list"
+    headers = {"Authorization": f"GoogleLogin auth={auth_token}"}
+    all_unread: List[Dict[str, Any]] = []
+    continuation = None
+
+    logger.info(f"Querying FreshRSS unread stream (xt=user/-/state/com.google/read) from {url}...")
+
+    for page in range(1, max_pages + 1):
+        params: Dict[str, Any] = {
+            "output": "json",
+            "n": limit,
+            "xt": "user/-/state/com.google/read"  # EXCLUDE READ = UNREAD ONLY!
+        }
+        if continuation:
+            params["c"] = continuation
+
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=30)
+            if r.status_code != 200:
+                logger.warning(f"FreshRSS stream request returned HTTP {r.status_code}: {r.text[:200]}")
+                break
+
+            data = r.json()
+            raw_items = data.get("items", [])
+            if not raw_items:
+                break
+
+            for item in raw_items:
+                item_id = str(item.get("id", ""))
+                title = (item.get("title") or "Untitled").strip()
+                crawl_time = item.get("crawlTimeMsec", "")
+                pub_time = int(crawl_time) // 1000 if crawl_time else int(time.time())
+
+                # URL extraction
+                url_val = ""
+                canon = item.get("canonical")
+                if canon and isinstance(canon, list) and canon[0].get("href"):
+                    url_val = canon[0]["href"]
+                elif item.get("alternate") and isinstance(item["alternate"], list) and item["alternate"][0].get("href"):
+                    url_val = item["alternate"][0]["href"]
+                elif item.get("href"):
+                    url_val = item["href"]
+
+                # Feed & Category extraction
+                origin = item.get("origin", {})
+                feed = origin.get("title") or "FreshRSS"
+                feed_stream_id = origin.get("streamId") or ""
+
+                categories = item.get("categories", [])
+                group = "General"
+                for cat in categories:
+                    if "user/-/label/" in cat:
+                        group = cat.split("user/-/label/")[-1].strip()
+                        break
+                    elif not cat.startswith("user/-/state/"):
+                        group = cat.split("/")[-1].strip()
+
+                # Content / summary
+                summary = item.get("summary", {}).get("content", "") or item.get("content", {}).get("content", "")
+                clean_text = re.sub(r"<[^>]+>", " ", summary)
+                clean_text = re.sub(r"\s+", " ", clean_text).strip() or title
+
+                all_unread.append({
+                    "id": item_id,
+                    "freshrss_id": item_id,
+                    "title": title,
+                    "url": url_val,
+                    "feed": feed,
+                    "feed_stream_id": feed_stream_id,
+                    "group": group,
+                    "published_at": pub_time,
+                    "text": clean_text
+                })
+
+            continuation = data.get("continuation")
+            if not continuation or len(raw_items) < limit:
+                break
+
+        except Exception as e:
+            logger.warning(f"Error fetching FreshRSS page {page}: {e}")
+            break
+
+    logger.info(f"Retrieved {len(all_unread)} UNREAD articles from FreshRSS API.")
+    return all_unread
+
+
+def mark_freshrss_items_read(api_base: str, auth_token: str, csrf_token: str, item_ids: List[str]) -> int:
+    """Marks the specified list of FreshRSS items as READ via the Google Reader /reader/api/0/edit-tag endpoint.
+    Sends form data: a=user/-/state/com.google/read & T=csrf_token & i=item_id (in batches of 50).
+    """
+    if not api_base or not auth_token or not item_ids:
+        return 0
+
+    endpoint = f"{api_base}/reader/api/0/edit-tag"
+    headers = {
+        "Authorization": f"GoogleLogin auth={auth_token}",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+
+    current_token = csrf_token or get_freshrss_action_token(api_base, auth_token)
+    if not current_token:
+        logger.error("Cannot mark articles as read: FreshRSS action token 'T' could not be acquired.")
+        return 0
+
+    batch_size = 50
+    marked_total = 0
+
+    for i in range(0, len(item_ids), batch_size):
+        chunk = item_ids[i:i + batch_size]
+        payload = [
+            ("a", "user/-/state/com.google/read"),
+            ("T", current_token)
+        ]
+        for it_id in chunk:
+            payload.append(("i", it_id))
+
+        try:
+            r = requests.post(endpoint, headers=headers, data=payload, timeout=20)
+            if r.status_code == 200 and "OK" in r.text.upper():
+                marked_total += len(chunk)
+            elif r.status_code == 400 or "token" in r.text.lower():
+                # Refresh token and retry once
+                current_token = get_freshrss_action_token(api_base, auth_token)
+                if current_token:
+                    payload[1] = ("T", current_token)
+                    r_retry = requests.post(endpoint, headers=headers, data=payload, timeout=20)
+                    if r_retry.status_code == 200:
+                        marked_total += len(chunk)
+            else:
+                logger.warning(f"FreshRSS edit-tag batch failed (HTTP {r.status_code}): {r.text[:150]}")
+        except Exception as e:
+            logger.warning(f"Error marking batch as read in FreshRSS: {e}")
+
+    logger.info(f"[✓] Successfully marked {marked_total}/{len(item_ids)} articles as READ in FreshRSS server API.")
+    return marked_total
+
+
+# ==============================================================================
+# PostgreSQL Connection and Schema Adaptation
+# ==============================================================================
 
 def connect_postgres(db: str):
     """Attempts PostgreSQL connection with fallback credentials."""
@@ -112,7 +357,7 @@ def connect_postgres(db: str):
 
 def detect_and_prep_pg_table(conn, dbname: str) -> Optional[Dict[str, Any]]:
     """Detects existing article/entry tables in PostgreSQL, inspects columns dynamically,
-    and ensures vector_indexed column and index exist.
+    ensures vector_indexed and freshrss_id columns and indexes exist.
     """
     with conn.cursor() as cur:
         # Check all non-system tables
@@ -175,6 +420,7 @@ def detect_and_prep_pg_table(conn, dbname: str) -> Optional[Dict[str, Any]]:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS public.articles (
                     id VARCHAR(512) PRIMARY KEY,
+                    freshrss_id VARCHAR(512),
                     title TEXT,
                     url TEXT,
                     feed TEXT,
@@ -186,6 +432,7 @@ def detect_and_prep_pg_table(conn, dbname: str) -> Optional[Dict[str, Any]]:
                 );
                 CREATE INDEX IF NOT EXISTS idx_articles_vector_indexed ON public.articles(vector_indexed);
                 CREATE INDEX IF NOT EXISTS idx_articles_published_at ON public.articles(published_at);
+                CREATE INDEX IF NOT EXISTS idx_articles_freshrss_id ON public.articles(freshrss_id);
             """)
             conn.commit()
 
@@ -205,10 +452,25 @@ def detect_and_prep_pg_table(conn, dbname: str) -> Optional[Dict[str, Any]]:
         """)
         conn.commit()
 
-        # Add index on vector_indexed if not exists for fast batch filtering
+        # Ensure freshrss_id column exists
+        cur.execute(f"""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                               WHERE table_schema = '{target_schema}' 
+                               AND table_name = '{target_table}' 
+                               AND column_name = 'freshrss_id') THEN
+                    ALTER TABLE {qualified} ADD COLUMN freshrss_id VARCHAR(512);
+                END IF;
+            END $$;
+        """)
+        conn.commit()
+
+        # Add indexes for speed
         safe_idx_name = f"idx_vec_{target_table[:20]}"
         try:
             cur.execute(f"CREATE INDEX IF NOT EXISTS {safe_idx_name} ON {qualified} (vector_indexed);")
+            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_freshrss_{target_table[:16]} ON {qualified} (freshrss_id);")
             conn.commit()
         except Exception:
             conn.rollback()
@@ -224,38 +486,32 @@ def detect_and_prep_pg_table(conn, dbname: str) -> Optional[Dict[str, Any]]:
         cols = set(col_types.keys())
         logger.info(f"Inspected columns for {qualified}: {sorted(cols)}")
 
-        # 1. Determine ID column
+        # Determine ID column
         id_candidates = ("id", "guid", "article_id", "entry_id", "link", "url")
         id_col = next((c for c in id_candidates if c in cols), sorted(cols)[0])
         id_is_int = any(k in col_types.get(id_col, "") for k in ("int", "serial"))
 
-        # 2. Determine Title expression
+        # Determine Title expression
         title_candidates = ("title", "headline", "subject", "name")
         title_col = next((c for c in title_candidates if c in cols), None)
         title_expr = f'COALESCE("{title_col}", \'Untitled\')' if title_col else "'Untitled'"
 
-        # 3. Determine URL expression
+        # Determine URL expression
         url_candidates = ("url", "link", "canonical", "permalink", "guid")
         url_col = next((c for c in url_candidates if c in cols), None)
         url_expr = f'COALESCE("{url_col}", \'\')' if url_col else "''"
 
-        # 4. Determine Feed expression
+        # Determine Feed expression
         feed_candidates = ("feed", "feed_name", "feed_title", "source", "source_name", "channel", "site_name", "author", "id_feed", "feed_id")
         feed_col = next((c for c in feed_candidates if c in cols), None)
-        if feed_col:
-            feed_expr = f'COALESCE("{feed_col}"::text, \'FreshRSS\')'
-        else:
-            feed_expr = "'FreshRSS'"
+        feed_expr = f'COALESCE("{feed_col}"::text, \'FreshRSS\')' if feed_col else "'FreshRSS'"
 
-        # 5. Determine Category expression
+        # Determine Category expression
         cat_candidates = ("category", "category_name", "group", "tag", "tags", "categories", "topic", "section")
         cat_col = next((c for c in cat_candidates if c in cols), None)
-        if cat_col:
-            category_expr = f'COALESCE("{cat_col}"::text, \'General\')'
-        else:
-            category_expr = "'General'"
+        category_expr = f'COALESCE("{cat_col}"::text, \'General\')' if cat_col else "'General'"
 
-        # 6. Determine Published timestamp expression (normalize to Unix Epoch seconds)
+        # Determine Published timestamp expression (normalize to Unix Epoch seconds)
         pub_candidates = ("published_at", "pub_date", "pubdate", "date", "published", "created_at", "timestamp", "crawl_time")
         pub_col = next((c for c in pub_candidates if c in cols), None)
         if pub_col:
@@ -269,13 +525,10 @@ def detect_and_prep_pg_table(conn, dbname: str) -> Optional[Dict[str, Any]]:
         else:
             pub_expr = 'EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)::bigint'
 
-        # 7. Determine Content expression
+        # Determine Content expression
         content_candidates = ("content", "body", "text", "summary", "description", "raw_content", "details")
         content_col = next((c for c in content_candidates if c in cols), None)
-        if content_col:
-            content_expr = f'COALESCE("{content_col}", \'\')'
-        else:
-            content_expr = f'{title_expr}'
+        content_expr = f'COALESCE("{content_col}", \'\')' if content_col else f'{title_expr}'
 
         # FreshRSS companion tables if relevant
         feed_table = None
@@ -288,6 +541,8 @@ def detect_and_prep_pg_table(conn, dbname: str) -> Optional[Dict[str, Any]]:
                 elif t_lower == "category" or t_lower.endswith("_category"):
                     category_table = f'"{s}"."{t}"'
 
+        has_freshrss_id_col = "freshrss_id" in cols
+
         return {
             "schema": target_schema,
             "table": target_table,
@@ -295,6 +550,7 @@ def detect_and_prep_pg_table(conn, dbname: str) -> Optional[Dict[str, Any]]:
             "type": table_type,
             "id_col": id_col,
             "id_is_int": id_is_int,
+            "has_freshrss_id_col": has_freshrss_id_col,
             "title_expr": title_expr,
             "url_expr": url_expr,
             "feed_expr": feed_expr,
@@ -306,80 +562,12 @@ def detect_and_prep_pg_table(conn, dbname: str) -> Optional[Dict[str, Any]]:
         }
 
 
-def get_freshrss_auth():
-    if not FRESHRSS_BASE_URL or not FRESHRSS_USER or not FRESHRSS_API_PASS:
-        return None
-    login_url = f"{FRESHRSS_BASE_URL}/accounts/ClientLogin"
-    try:
-        r = requests.post(
-            login_url,
-            data={"Email": FRESHRSS_USER, "Passwd": FRESHRSS_API_PASS},
-            params={"output": "json"},
-            timeout=10
-        )
-        if r.status_code == 200:
-            for line in r.text.splitlines():
-                if line.startswith("Auth="):
-                    return line.split("Auth=", 1)[1].strip()
-    except Exception as e:
-        logger.warning(f"FreshRSS login failed: {e}")
-    return None
-
-
-def fetch_freshrss_items(auth_token, limit=500, max_pages=3):
-    """Fetches reading list items via Google Reader API with pagination."""
-    if not auth_token:
-        return []
-    url = f"{FRESHRSS_BASE_URL}/reader/api/0/stream/contents/reading-list"
-    headers = {"Authorization": f"GoogleLogin auth={auth_token}"}
-    items = []
-    continuation = None
-
-    for _ in range(max_pages):
-        params = {"n": limit, "output": "json"}
-        if continuation:
-            params["c"] = continuation
-        try:
-            r = requests.get(url, headers=headers, params=params, timeout=25)
-            if r.status_code != 200:
-                break
-            data = r.json()
-            raw_items = data.get("items", [])
-            for item in raw_items:
-                item_id = str(item.get("id", ""))
-                title = item.get("title", "Untitled")
-                crawl_time = item.get("crawlTimeMsec", "")
-                pub_time = int(crawl_time) // 1000 if crawl_time else int(time.time())
-                url_val = item.get("canonical", [{}])[0].get("href") or item.get("alternate", [{}])[0].get("href", "")
-                origin = item.get("origin", {})
-                feed = origin.get("title") or "FreshRSS"
-                categories = item.get("categories", [])
-                group = categories[0].split("/")[-1] if categories else "General"
-                summary = item.get("summary", {}).get("content", "") or item.get("content", {}).get("content", "")
-                clean_text = re.sub(r"<[^>]+>", " ", summary).strip() or title
-
-                items.append({
-                    "id": item_id,
-                    "title": title,
-                    "url": url_val,
-                    "feed": feed,
-                    "group": group,
-                    "published_at": pub_time,
-                    "text": clean_text
-                })
-
-            continuation = data.get("continuation")
-            if not continuation or len(raw_items) < limit:
-                break
-        except Exception as e:
-            logger.warning(f"Error fetching FreshRSS items: {e}")
-            break
-
-    return items
-
+# ==============================================================================
+# OpenVINO Embeddings (Intel NPU) & Qdrant Operations
+# ==============================================================================
 
 def get_embedding(text: str) -> Optional[List[float]]:
-    """Single-item embedding fallback."""
+    """Single-item embedding generation via OpenVINO server."""
     for endpoint, payload in [
         ("/api/embed", {"model": EMBED_MODEL, "input": text[:2000]}),
         ("/api/embeddings", {"model": EMBED_MODEL, "prompt": text[:2000]})
@@ -398,9 +586,7 @@ def get_embedding(text: str) -> Optional[List[float]]:
 
 
 def get_embeddings_batch(texts: List[str]) -> List[Optional[List[float]]]:
-    """Generates embeddings for a batch of texts using OpenVINO server.
-    Leverages batch endpoint if available, with robust single-item fallback.
-    """
+    """Generates embeddings for a batch of texts using OpenVINO server on Intel NPU."""
     if not texts:
         return []
     truncated = [t[:2000] for t in texts]
@@ -426,9 +612,7 @@ def get_embeddings_batch(texts: List[str]) -> List[Optional[List[float]]]:
 
 
 def ensure_qdrant_collection(qdrant: QdrantClient) -> bool:
-    """Verifies Qdrant collection exists and matches EMBED_DIMS. Recreates if missing or mismatched.
-    Returns True if the collection was newly created/recreated (indicating a full rebuild is required).
-    """
+    """Verifies Qdrant collection exists and matches EMBED_DIMS. Recreates if missing or mismatched."""
     needs_rebuild = False
     try:
         collections = qdrant.get_collections().collections
@@ -476,14 +660,20 @@ def ensure_qdrant_collection(qdrant: QdrantClient) -> bool:
     return needs_rebuild
 
 
+# ==============================================================================
+# Main Orchestration Loop
+# ==============================================================================
+
 def main():
-    logger.info("Starting FreshRSS -> Postgres -> Qdrant sync run...")
+    logger.info("=" * 70)
+    logger.info("Starting FreshRSS -> PostgreSQL -> OpenVINO (NPU) -> Qdrant Sync")
+    logger.info("=" * 70)
 
     # 1. Connect to Qdrant
     try:
         qdrant = QdrantClient(url=QDRANT_URL, timeout=15)
-        # Test connection
         qdrant.get_collections()
+        logger.info(f"[✓] Connected to Qdrant at {QDRANT_URL} (collection: {QDRANT_COLLECTION})")
     except Exception as e:
         logger.error(f"Could not connect to Qdrant at {QDRANT_URL}: {e}")
         sys.exit(1)
@@ -496,15 +686,14 @@ def main():
         if conn:
             table_info = detect_and_prep_pg_table(conn, db)
             if table_info:
-                logger.info(f"Connected to PostgreSQL database '{db}', using table {table_info['qualified']}.")
+                logger.info(f"[✓] PostgreSQL ready on database '{db}', active table {table_info['qualified']}.")
                 break
             else:
                 conn.close()
                 conn = None
 
-    # 3. Check Qdrant collection status; rebuild if missing or empty
+    # 3. Check Qdrant collection status; recreate if needed
     needs_rebuild = ensure_qdrant_collection(qdrant)
-
     if needs_rebuild and conn and table_info:
         qualified = table_info["qualified"]
         logger.info(f"Resetting vector_indexed=FALSE on PostgreSQL table {qualified} to trigger full re-embedding...")
@@ -516,28 +705,46 @@ def main():
             conn.rollback()
             logger.error(f"Failed to reset vector_indexed on {qualified}: {e}")
 
-    # 4. Ingest new articles from FreshRSS API if credentials are provided
-    auth_token = get_freshrss_auth()
-    new_items = []
-    if auth_token:
-        logger.info("Fetching latest articles from FreshRSS API...")
-        new_items = fetch_freshrss_items(auth_token, limit=200, max_pages=3)
-        logger.info(f"Retrieved {len(new_items)} items from FreshRSS.")
+    # 4. Connect to FreshRSS API & fetch all UNREAD articles
+    api_base, auth_token = freshrss_login(FRESHRSS_BASE_URL, FRESHRSS_USER, FRESHRSS_API_PASS)
+    csrf_token = None
+    unread_items: List[Dict[str, Any]] = []
 
-        # Insert new items into PostgreSQL if available
-        if conn and table_info and new_items:
-            qualified = table_info["qualified"]
-            id_col = table_info["id_col"]
-            with conn.cursor() as cur:
-                inserted_count = 0
-                for it in new_items:
-                    try:
+    if api_base and auth_token:
+        csrf_token = get_freshrss_action_token(api_base, auth_token)
+        unread_items = fetch_unread_freshrss_articles(api_base, auth_token, limit=200, max_pages=10)
+
+    # In-memory mapping of article IDs to FreshRSS IDs for mark-as-read tracking
+    freshrss_pending_to_mark: Dict[str, str] = {}
+    for item in unread_items:
+        key = item["url"] or item["id"]
+        freshrss_pending_to_mark[key] = item["id"]
+
+    # 5. Export UNREAD articles to PostgreSQL
+    if conn and table_info and unread_items:
+        qualified = table_info["qualified"]
+        id_col = table_info["id_col"]
+        has_freshrss_col = table_info.get("has_freshrss_id_col", True)
+
+        logger.info(f"Exporting {len(unread_items)} UNREAD articles to PostgreSQL table {qualified}...")
+        with conn.cursor() as cur:
+            inserted_count = 0
+            for it in unread_items:
+                primary_id = it["id"] or it["url"]
+                try:
+                    if has_freshrss_col:
                         cur.execute(f"""
-                            INSERT INTO {qualified} ({id_col}, title, url, feed, category, published_at, content, vector_indexed)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE)
-                            ON CONFLICT ({id_col}) DO NOTHING;
+                            INSERT INTO {qualified} ({id_col}, freshrss_id, title, url, feed, category, published_at, content, vector_indexed)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, FALSE)
+                            ON CONFLICT ({id_col}) DO UPDATE SET
+                                title = EXCLUDED.title,
+                                content = EXCLUDED.content,
+                                category = EXCLUDED.category,
+                                published_at = EXCLUDED.published_at,
+                                freshrss_id = COALESCE(EXCLUDED.freshrss_id, {qualified}.freshrss_id);
                         """, (
-                            it["id"] or it["url"],
+                            primary_id,
+                            it["id"],
                             it["title"],
                             it["url"],
                             it["feed"],
@@ -545,34 +752,60 @@ def main():
                             it["published_at"],
                             it["text"]
                         ))
-                        if cur.rowcount > 0:
-                            inserted_count += 1
-                    except Exception:
-                        conn.rollback()
-                        break
-                conn.commit()
-                if inserted_count > 0:
-                    logger.info(f"Inserted {inserted_count} new articles from FreshRSS into {qualified}.")
+                    else:
+                        cur.execute(f"""
+                            INSERT INTO {qualified} ({id_col}, title, url, feed, category, published_at, content, vector_indexed)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE)
+                            ON CONFLICT ({id_col}) DO UPDATE SET
+                                title = EXCLUDED.title,
+                                content = EXCLUDED.content,
+                                category = EXCLUDED.category,
+                                published_at = EXCLUDED.published_at;
+                        """, (
+                            primary_id,
+                            it["title"],
+                            it["url"],
+                            it["feed"],
+                            it["group"],
+                            it["published_at"],
+                            it["text"]
+                        ))
 
-    # 5. Fetch unindexed records from PostgreSQL and embed into Qdrant
+                    if cur.rowcount > 0:
+                        inserted_count += 1
+                except Exception as e_ins:
+                    conn.rollback()
+                    logger.warning(f"Error inserting article '{it['title'][:40]}': {e_ins}")
+                    break
+            conn.commit()
+            logger.info(f"[✓] Exported {inserted_count} articles to PostgreSQL {qualified}.")
+
+    # 6. Fetch unindexed records from PostgreSQL, embed with OpenVINO, upsert to Qdrant,
+    #    and AFTER THAT mark them as READ in FreshRSS!
+    total_embedded = 0
+    successfully_embedded_freshrss_ids: List[str] = []
+
     if conn and table_info:
         qualified = table_info["qualified"]
         id_col = table_info["id_col"]
         id_is_int = table_info["id_is_int"]
+        has_freshrss_col = table_info.get("has_freshrss_id_col", False)
 
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             cur.execute(f"SELECT COUNT(*) FROM {qualified} WHERE vector_indexed IS FALSE OR vector_indexed IS NULL;")
             total_unindexed = cur.fetchone()[0]
-            logger.info(f"Found {total_unindexed:,} articles in PostgreSQL requiring vector embedding.")
+            logger.info(f"Articles requiring embedding in PostgreSQL: {total_unindexed:,}")
 
             if total_unindexed > 0:
                 batch_size = 50
                 processed = 0
 
-                # Build dynamic SELECT query based on inspected columns
+                # Determine SELECT query
+                freshrss_sel = "freshrss_id" if has_freshrss_col else f"'{id_col}'"
                 if table_info["type"] == "freshrss" and table_info["feed_table"]:
                     select_sql = f"""
                         SELECT e.{id_col} AS id,
+                               e.{freshrss_sel} AS freshrss_id,
                                e.title AS title,
                                COALESCE(e.link, '') AS url,
                                COALESCE(f.name, 'FreshRSS') AS feed,
@@ -588,6 +821,7 @@ def main():
                 else:
                     select_sql = f"""
                         SELECT "{id_col}" AS id,
+                               {freshrss_sel} AS freshrss_id,
                                {table_info['title_expr']} AS title,
                                {table_info['url_expr']} AS url,
                                {table_info['feed_expr']} AS feed,
@@ -611,17 +845,26 @@ def main():
                     for row in rows:
                         title = row.get("title") or "Untitled"
                         text = row.get("content") or title
-                        clean_text = re.sub(r"<[^>]+>", " ", text).strip() or title
+                        clean_text = re.sub(r"<[^>]+>", " ", text)
+                        clean_text = re.sub(r"\s+", " ", clean_text).strip() or title
                         url_val = row.get("url") or ""
                         feed_val = row.get("feed") or "News"
                         group_val = row.get("category") or "General"
                         pub_time = row.get("published_at") or int(time.time())
+
+                        # FreshRSS ID tracking
+                        f_id = row.get("freshrss_id")
+                        if not f_id or f_id == id_col:
+                            f_id = freshrss_pending_to_mark.get(url_val) or freshrss_pending_to_mark.get(str(row["id"]))
+                            if not f_id and str(row["id"]).startswith("tag:google.com"):
+                                f_id = str(row["id"])
 
                         embed_text = f"{title}\n{clean_text}"
                         texts_to_embed.append(embed_text)
 
                         row_metadata.append({
                             "raw_id": row["id"],
+                            "freshrss_id": f_id,
                             "title": title,
                             "url": url_val,
                             "feed": feed_val,
@@ -630,11 +873,12 @@ def main():
                             "text": clean_text
                         })
 
-                    # Batch embedding via OpenVINO server
+                    # Generate embeddings via OpenVINO on Intel NPU
                     vectors = get_embeddings_batch(texts_to_embed)
 
                     points_to_upsert = []
                     processed_ids = []
+                    batch_freshrss_ids = []
 
                     for meta, vec in zip(row_metadata, vectors):
                         if vec and len(vec) == EMBED_DIMS:
@@ -649,11 +893,14 @@ def main():
                             }
                             points_to_upsert.append(PointStruct(id=pt_id, vector=vec, payload=payload))
                             processed_ids.append(meta["raw_id"])
+                            if meta.get("freshrss_id"):
+                                batch_freshrss_ids.append(meta["freshrss_id"])
 
                     if points_to_upsert:
+                        # Upsert to Qdrant
                         qdrant.upsert(collection_name=QDRANT_COLLECTION, points=points_to_upsert)
 
-                        # Mark batch as indexed in PostgreSQL
+                        # Update vector_indexed=TRUE in PostgreSQL
                         if id_is_int:
                             clean_ids = [int(x) for x in processed_ids if str(x).isdigit()]
                         else:
@@ -667,22 +914,30 @@ def main():
                             conn.commit()
 
                         processed += len(points_to_upsert)
+                        total_embedded += len(points_to_upsert)
                         pct = (processed / total_unindexed) * 100
-                        logger.info(f"Rebuilding database: {processed:,} / {total_unindexed:,} ({pct:.1f}%) articles indexed into Qdrant...")
+                        logger.info(f"Embedded & Upserted: {processed:,} / {total_unindexed:,} ({pct:.1f}%) into Qdrant '{QDRANT_COLLECTION}'...")
+
+                        # AFTER embedding and Qdrant ingestion, mark this batch as read in FreshRSS
+                        if api_base and auth_token and batch_freshrss_ids:
+                            mark_freshrss_items_read(api_base, auth_token, csrf_token, batch_freshrss_ids)
+                            successfully_embedded_freshrss_ids.extend(batch_freshrss_ids)
                     else:
                         logger.warning("No vectors generated for current batch. Checking embedding service...")
                         time.sleep(2)
 
         conn.close()
 
-    # 6. Direct embed fallback if PostgreSQL was not configured or empty, but FreshRSS items exist
+    # 7. Fallback direct embedding if PostgreSQL was not available or empty, but unread items exist
     col_now = qdrant.get_collection(QDRANT_COLLECTION)
-    if (col_now.points_count or 0) == 0 and new_items:
-        logger.info(f"Embedding {len(new_items)} FreshRSS items directly into Qdrant...")
-        texts = [f"{it['title']}\n{it['text']}" for it in new_items]
+    if (col_now.points_count or 0) == 0 and unread_items and total_embedded == 0:
+        logger.info(f"PostgreSQL empty or offline. Embedding {len(unread_items)} FreshRSS items directly into Qdrant...")
+        texts = [f"{it['title']}\n{it['text']}" for it in unread_items]
         vectors = get_embeddings_batch(texts)
         points = []
-        for it, vec in zip(new_items, vectors):
+        direct_marked_ids = []
+
+        for it, vec in zip(unread_items, vectors):
             if vec and len(vec) == EMBED_DIMS:
                 pt_id = str(uuid.uuid5(uuid.NAMESPACE_URL, it["id"] or it["url"]))
                 points.append(PointStruct(id=pt_id, vector=vec, payload={
@@ -693,11 +948,20 @@ def main():
                     "published_at": it["published_at"],
                     "text": it["text"]
                 }))
+                direct_marked_ids.append(it["id"])
+
         if points:
             qdrant.upsert(collection_name=QDRANT_COLLECTION, points=points)
+            logger.info(f"[✓] Directly upserted {len(points)} points into Qdrant.")
+            # AFTER embedding, mark as read in FreshRSS
+            if api_base and auth_token and direct_marked_ids:
+                mark_freshrss_items_read(api_base, auth_token, csrf_token, direct_marked_ids)
 
+    # 8. Report final metrics
     final_count = qdrant.get_collection(QDRANT_COLLECTION).points_count or 0
-    logger.info(f"Sync run finished successfully. Current Qdrant point count: {final_count:,}.")
+    logger.info("=" * 70)
+    logger.info(f"Sync complete. Total points in Qdrant '{QDRANT_COLLECTION}': {final_count:,}.")
+    logger.info("=" * 70)
 
 
 if __name__ == "__main__":
