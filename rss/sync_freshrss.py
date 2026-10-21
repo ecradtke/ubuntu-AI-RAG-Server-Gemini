@@ -4,16 +4,18 @@
 Pipeline Workflow:
   1. Connects to the FreshRSS Server API (Google Reader compatible API).
   2. Queries all UNREAD messages using `xt=user/-/state/com.google/read`.
-  3. Exports the unread messages to PostgreSQL adapting dynamically to the table's
-     schema (e.g. rss_articles with feed_title, clean_content, "group", author,
-     fetched_at, vector_indexed=FALSE, freshrss_id).
+  3. Checks PostgreSQL table (e.g. public.rss_articles):
+     - Unread items already in PostgreSQL with vector_indexed=TRUE are queued to be
+       marked as READ in FreshRSS (clearing stale unread queue).
+     - Genuinely new unread items are inserted into PostgreSQL with vector_indexed=FALSE
+       using exact columns (id, feed_title, title, url, author, clean_content,
+       "group", published_at, fetched_at, vector_indexed, freshrss_id).
   4. Generates dense vector embeddings via OpenVINO on Intel NPU (bge-base 768d)
-     and upserts points into Qdrant collection 'rss_articles' matching sample payload:
+     and upserts points into Qdrant collection 'rss_articles' matching payload format:
      { title, url, feed, group, published_at, text }.
   5. Updates PostgreSQL records to vector_indexed=TRUE.
-  6. AFTER successful embedding and Qdrant ingestion, calls the FreshRSS API
-     (`/reader/api/0/edit-tag` with `a=user/-/state/com.google/read`) to mark the
-     processed articles as READ in the FreshRSS server.
+  6. Calls the FreshRSS API (/reader/api/0/edit-tag with a=user/-/state/com.google/read)
+     to mark all processed and already-indexed articles as READ in the FreshRSS server.
 """
 
 import os
@@ -187,7 +189,7 @@ def get_freshrss_action_token(api_base: str, auth_token: str) -> Optional[str]:
     return None
 
 
-def fetch_unread_freshrss_articles(api_base: str, auth_token: str, limit: int = 150, max_pages: int = 15) -> List[Dict[str, Any]]:
+def fetch_unread_freshrss_articles(api_base: str, auth_token: str, limit: int = 150, max_pages: int = 20) -> List[Dict[str, Any]]:
     """Fetches ALL UNREAD items from FreshRSS using `xt=user/-/state/com.google/read`
     with pagination support.
     """
@@ -303,11 +305,14 @@ def mark_freshrss_items_read(api_base: str, auth_token: str, csrf_token: str, it
         logger.error("Cannot mark articles as read: FreshRSS action token 'T' could not be acquired.")
         return 0
 
+    unique_ids = list(set(item_ids))
     batch_size = 50
     marked_total = 0
 
-    for i in range(0, len(item_ids), batch_size):
-        chunk = item_ids[i:i + batch_size]
+    logger.info(f"Marking {len(unique_ids)} articles as READ in FreshRSS server API...")
+
+    for i in range(0, len(unique_ids), batch_size):
+        chunk = unique_ids[i:i + batch_size]
         payload = [
             ("a", "user/-/state/com.google/read"),
             ("T", current_token)
@@ -331,7 +336,7 @@ def mark_freshrss_items_read(api_base: str, auth_token: str, csrf_token: str, it
         except Exception as e:
             logger.warning(f"Error marking batch as read in FreshRSS: {e}")
 
-    logger.info(f"[✓] Successfully marked {marked_total}/{len(item_ids)} articles as READ in FreshRSS server API.")
+    logger.info(f"[✓] Successfully marked {marked_total}/{len(unique_ids)} articles as READ in FreshRSS server API.")
     return marked_total
 
 
@@ -492,21 +497,32 @@ def detect_and_prep_pg_table(conn, dbname: str) -> Optional[Dict[str, Any]]:
         cols = set(col_types.keys())
         logger.info(f"Inspected columns for {qualified}: {sorted(cols)}")
 
-        # Detect PRIMARY KEY or UNIQUE constraints
-        cur.execute("""
-            SELECT ccu.column_name
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.constraint_column_usage AS ccu 
-              ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema
-            WHERE tc.table_schema = %s AND tc.table_name = %s
-              AND tc.constraint_type IN ('PRIMARY KEY', 'UNIQUE');
-        """, (target_schema, target_table))
-        unique_columns = set(r[0].lower() for r in cur.fetchall())
+        # Detect PRIMARY KEY or UNIQUE constraints using system catalog
+        unique_columns: Set[str] = set()
+        try:
+            cur.execute("""
+                SELECT DISTINCT a.attname
+                FROM pg_class t
+                JOIN pg_index ix ON t.oid = ix.indrelid
+                JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE n.nspname = %s
+                  AND t.relname = %s
+                  AND ix.indisunique = true;
+            """, (target_schema, target_table))
+            for r in cur.fetchall():
+                unique_columns.add(r[0].lower())
+        except Exception as e_u:
+            logger.debug(f"Could not query pg_index: {e_u}")
+
+        logger.info(f"Unique/Primary columns for {qualified}: {sorted(unique_columns)}")
 
         # Determine ID column
         id_candidates = ("id", "guid", "article_id", "entry_id", "link", "url")
         id_col = next((c for c in id_candidates if c in cols), sorted(cols)[0])
-        id_is_int = any(k in col_types.get(id_col, "") for k in ("int", "serial"))
+        id_type = col_types.get(id_col, "")
+        id_is_int = any(k in id_type for k in ("int", "serial", "bigint", "smallint"))
+        id_is_uuid = "uuid" in id_type
 
         # Determine Title column
         title_candidates = ("title", "headline", "subject", "name")
@@ -546,13 +562,13 @@ def detect_and_prep_pg_table(conn, dbname: str) -> Optional[Dict[str, Any]]:
         # FreshRSS ID column
         freshrss_id_col = "freshrss_id" if "freshrss_id" in cols else None
 
-        # Determine conflict target: prefer primary key column, then url
+        # Determine conflict target: ONLY use if a real unique index exists in PostgreSQL
         if id_col and id_col.lower() in unique_columns:
             conflict_target = id_col
         elif url_col and url_col.lower() in unique_columns:
             conflict_target = url_col
         else:
-            conflict_target = id_col
+            conflict_target = None
 
         # SQL expressions for SELECT
         title_expr = f'COALESCE("{title_col}", \'Untitled\')' if title_col else "'Untitled'"
@@ -594,6 +610,7 @@ def detect_and_prep_pg_table(conn, dbname: str) -> Optional[Dict[str, Any]]:
             "unique_columns": unique_columns,
             "id_col": id_col,
             "id_is_int": id_is_int,
+            "id_is_uuid": id_is_uuid,
             "title_col": title_col,
             "url_col": url_col,
             "feed_col": feed_col,
@@ -767,110 +784,175 @@ def main():
 
     if api_base and auth_token:
         csrf_token = get_freshrss_action_token(api_base, auth_token)
-        unread_items = fetch_unread_freshrss_articles(api_base, auth_token, limit=200, max_pages=15)
+        unread_items = fetch_unread_freshrss_articles(api_base, auth_token, limit=200, max_pages=20)
 
-    # In-memory mapping of article IDs to FreshRSS IDs for mark-as-read tracking
-    freshrss_pending_to_mark: Dict[str, str] = {}
-    for item in unread_items:
-        key = item["url"] or item["id"]
-        freshrss_pending_to_mark[key] = item["id"]
+    # 5. Check PostgreSQL for existing records & export genuinely new articles
+    already_indexed_freshrss_ids: List[str] = []
+    new_items_to_insert: List[Dict[str, Any]] = []
 
-    # 5. Export UNREAD articles to PostgreSQL using exact column mappings
     if conn and table_info and unread_items:
         qualified = table_info["qualified"]
         cols: Set[str] = table_info["cols"]
         id_col = table_info["id_col"]
+        url_col = table_info["url_col"]
         id_is_int = table_info["id_is_int"]
+        id_is_uuid = table_info.get("id_is_uuid", False)
         conflict_target = table_info["conflict_target"]
 
-        logger.info(f"Exporting {len(unread_items)} UNREAD articles to PostgreSQL table {qualified}...")
+        # Pre-query existing records by URL and ID to separate already-indexed from new articles
+        indexed_urls: Set[str] = set()
+        indexed_ids: Set[str] = set()
+        unindexed_urls: Set[str] = set()
+        unindexed_ids: Set[str] = set()
+
+        all_urls = [it["url"] for it in unread_items if it.get("url")]
+        all_ids = [str(it["id"]) for it in unread_items if it.get("id")]
 
         with conn.cursor() as cur:
+            if all_urls and url_col:
+                for chunk_idx in range(0, len(all_urls), 500):
+                    url_chunk = all_urls[chunk_idx:chunk_idx + 500]
+                    cur.execute(f"""
+                        SELECT "{url_col}", vector_indexed 
+                        FROM {qualified} 
+                        WHERE "{url_col}" = ANY(%s);
+                    """, (url_chunk,))
+                    for r in cur.fetchall():
+                        u_val, vec = r[0], bool(r[1])
+                        if vec:
+                            indexed_urls.add(u_val)
+                        else:
+                            unindexed_urls.add(u_val)
+
+            # Also check by freshrss_id column or id column
+            id_check_col = table_info["freshrss_id_col"] or (id_col if not id_is_int else None)
+            if all_ids and id_check_col:
+                for chunk_idx in range(0, len(all_ids), 500):
+                    id_chunk = all_ids[chunk_idx:chunk_idx + 500]
+                    cur.execute(f"""
+                        SELECT "{id_check_col}", vector_indexed 
+                        FROM {qualified} 
+                        WHERE "{id_check_col}" = ANY(%s);
+                    """, (id_chunk,))
+                    for r in cur.fetchall():
+                        i_val, vec = str(r[0]), bool(r[1])
+                        if vec:
+                            indexed_ids.add(i_val)
+                        else:
+                            unindexed_ids.add(i_val)
+
+        for it in unread_items:
+            u = it.get("url") or ""
+            f_id = str(it.get("freshrss_id") or it.get("id") or "")
+            if (u and u in indexed_urls) or (f_id and f_id in indexed_ids):
+                # Already stored and embedded in Qdrant! Queue for FreshRSS mark-as-read
+                already_indexed_freshrss_ids.append(it["freshrss_id"])
+            elif (u and u in unindexed_urls) or (f_id and f_id in unindexed_ids):
+                # Already in PostgreSQL, will be embedded in Step 6
+                pass
+            else:
+                new_items_to_insert.append(it)
+
+        logger.info(
+            f"Unread analysis: {len(already_indexed_freshrss_ids)} already indexed in PostgreSQL/Qdrant (will be marked read), "
+            f"{len(new_items_to_insert)} new articles to insert."
+        )
+
+        # Insert new articles
+        if new_items_to_insert:
+            logger.info(f"Exporting {len(new_items_to_insert)} UNREAD articles to PostgreSQL table {qualified}...")
             inserted_count = 0
-            for it in unread_items:
-                # Resolve ID
-                if id_is_int:
-                    val_str = str(it["id"] or it["url"])
-                    if val_str.isdigit():
-                        primary_id = int(val_str)
-                    elif "item/" in val_str:
-                        try:
-                            primary_id = int(val_str.split("item/")[-1], 16)
-                        except ValueError:
+            error_log_count = 0
+
+            with conn.cursor() as cur:
+                for it in new_items_to_insert:
+                    # Resolve primary ID according to column data type
+                    if id_is_uuid:
+                        primary_id = str(uuid.uuid5(uuid.NAMESPACE_URL, str(it["url"] or it["id"])))
+                    elif id_is_int:
+                        val_str = str(it["id"] or it["url"])
+                        if val_str.isdigit():
+                            primary_id = int(val_str)
+                        elif "item/" in val_str:
+                            try:
+                                primary_id = int(val_str.split("item/")[-1], 16)
+                            except ValueError:
+                                primary_id = abs(hash(val_str)) % (2**63 - 1)
+                        else:
                             primary_id = abs(hash(val_str)) % (2**63 - 1)
                     else:
-                        primary_id = abs(hash(val_str)) % (2**63 - 1)
-                else:
-                    primary_id = str(it["id"] or it["url"])
+                        primary_id = str(it["id"] or it["url"])
 
-                # Build dictionary of column values for this row
-                col_dict: Dict[str, Any] = {}
-                if id_col in cols:
-                    col_dict[id_col] = primary_id
-                if table_info["freshrss_id_col"] and table_info["freshrss_id_col"] in cols:
-                    col_dict[table_info["freshrss_id_col"]] = it["freshrss_id"]
-                if table_info["title_col"] and table_info["title_col"] in cols:
-                    col_dict[table_info["title_col"]] = it["title"]
-                if table_info["url_col"] and table_info["url_col"] in cols:
-                    col_dict[table_info["url_col"]] = it["url"]
-                if table_info["feed_col"] and table_info["feed_col"] in cols:
-                    col_dict[table_info["feed_col"]] = it["feed"]
-                if table_info["author_col"] and table_info["author_col"] in cols:
-                    col_dict[table_info["author_col"]] = it.get("author") or it.get("feed") or ""
-                if table_info["content_col"] and table_info["content_col"] in cols:
-                    col_dict[table_info["content_col"]] = it["text"]
-                if table_info["group_col"] and table_info["group_col"] in cols:
-                    col_dict[table_info["group_col"]] = it["group"]
-                if table_info["pub_col"] and table_info["pub_col"] in cols:
-                    col_dict[table_info["pub_col"]] = it["published_at"]
-                if table_info["fetched_at_col"] and table_info["fetched_at_col"] in cols:
-                    col_dict[table_info["fetched_at_col"]] = int(time.time())
-                if table_info["vector_indexed_col"] and table_info["vector_indexed_col"] in cols:
-                    col_dict[table_info["vector_indexed_col"]] = False
+                    # Build column value dictionary
+                    col_dict: Dict[str, Any] = {}
+                    if id_col in cols:
+                        col_dict[id_col] = primary_id
+                    if table_info["freshrss_id_col"] and table_info["freshrss_id_col"] in cols:
+                        col_dict[table_info["freshrss_id_col"]] = it["freshrss_id"]
+                    if table_info["title_col"] and table_info["title_col"] in cols:
+                        col_dict[table_info["title_col"]] = it["title"]
+                    if table_info["url_col"] and table_info["url_col"] in cols:
+                        col_dict[table_info["url_col"]] = it["url"]
+                    if table_info["feed_col"] and table_info["feed_col"] in cols:
+                        col_dict[table_info["feed_col"]] = it["feed"]
+                    if table_info["author_col"] and table_info["author_col"] in cols:
+                        col_dict[table_info["author_col"]] = it.get("author") or it.get("feed") or ""
+                    if table_info["content_col"] and table_info["content_col"] in cols:
+                        col_dict[table_info["content_col"]] = it["text"]
+                    if table_info["group_col"] and table_info["group_col"] in cols:
+                        col_dict[table_info["group_col"]] = it["group"]
+                    if table_info["pub_col"] and table_info["pub_col"] in cols:
+                        col_dict[table_info["pub_col"]] = it["published_at"]
+                    if table_info["fetched_at_col"] and table_info["fetched_at_col"] in cols:
+                        col_dict[table_info["fetched_at_col"]] = int(time.time())
+                    if table_info["vector_indexed_col"] and table_info["vector_indexed_col"] in cols:
+                        col_dict[table_info["vector_indexed_col"]] = False
 
-                col_names = list(col_dict.keys())
-                col_names_quoted = [f'"{c}"' for c in col_names]
-                placeholders = ["%s"] * len(col_names)
-                values = [col_dict[c] for c in col_names]
+                    col_names = list(col_dict.keys())
+                    col_names_quoted = [f'"{c}"' for c in col_names]
+                    placeholders = ["%s"] * len(col_names)
+                    values = [col_dict[c] for c in col_names]
 
-                # Update all non-id fields on conflict
-                update_cols = [c for c in col_names if c != conflict_target and c != id_col]
-                if update_cols and conflict_target in col_dict:
-                    update_sql = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in update_cols)
-                    insert_sql = f"""
-                        INSERT INTO {qualified} ({", ".join(col_names_quoted)})
-                        VALUES ({", ".join(placeholders)})
-                        ON CONFLICT ("{conflict_target}") DO UPDATE SET {update_sql};
-                    """
-                elif conflict_target in col_dict:
-                    insert_sql = f"""
-                        INSERT INTO {qualified} ({", ".join(col_names_quoted)})
-                        VALUES ({", ".join(placeholders)})
-                        ON CONFLICT ("{conflict_target}") DO NOTHING;
-                    """
-                else:
-                    insert_sql = f"""
-                        INSERT INTO {qualified} ({", ".join(col_names_quoted)})
-                        VALUES ({", ".join(placeholders)});
-                    """
+                    if conflict_target and conflict_target in col_dict:
+                        update_cols = [c for c in col_names if c != conflict_target]
+                        if update_cols:
+                            update_sql = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in update_cols)
+                            insert_sql = f"""
+                                INSERT INTO {qualified} ({", ".join(col_names_quoted)})
+                                VALUES ({", ".join(placeholders)})
+                                ON CONFLICT ("{conflict_target}") DO UPDATE SET {update_sql};
+                            """
+                        else:
+                            insert_sql = f"""
+                                INSERT INTO {qualified} ({", ".join(col_names_quoted)})
+                                VALUES ({", ".join(placeholders)})
+                                ON CONFLICT ("{conflict_target}") DO NOTHING;
+                            """
+                    else:
+                        insert_sql = f"""
+                            INSERT INTO {qualified} ({", ".join(col_names_quoted)})
+                            VALUES ({", ".join(placeholders)});
+                        """
 
-                try:
-                    cur.execute("SAVEPOINT sp_insert_item;")
-                    cur.execute(insert_sql, tuple(values))
-                    cur.execute("RELEASE SAVEPOINT sp_insert_item;")
-                    if cur.rowcount > 0:
-                        inserted_count += 1
-                except Exception as e_row:
-                    cur.execute("ROLLBACK TO SAVEPOINT sp_insert_item;")
-                    logger.debug(f"Could not insert article '{it['title'][:30]}': {e_row}")
+                    try:
+                        cur.execute("SAVEPOINT sp_insert_item;")
+                        cur.execute(insert_sql, tuple(values))
+                        cur.execute("RELEASE SAVEPOINT sp_insert_item;")
+                        if cur.rowcount > 0:
+                            inserted_count += 1
+                    except Exception as e_ins:
+                        cur.execute("ROLLBACK TO SAVEPOINT sp_insert_item;")
+                        if error_log_count < 5:
+                            logger.warning(f"Insert error for '{it['title'][:40]}': {e_ins}")
+                            error_log_count += 1
 
-            conn.commit()
-            logger.info(f"[✓] Exported {inserted_count} articles to PostgreSQL {qualified}.")
+                conn.commit()
+                logger.info(f"[✓] Exported {inserted_count} new articles to PostgreSQL {qualified}.")
 
     # 6. Fetch unindexed records from PostgreSQL, embed with OpenVINO (Intel NPU),
-    #    upsert into Qdrant, and AFTER THAT mark them as READ in FreshRSS!
+    #    upsert into Qdrant, and update vector_indexed=TRUE
     total_embedded = 0
-    successfully_embedded_freshrss_ids: List[str] = []
+    newly_embedded_freshrss_ids: List[str] = []
 
     if conn and table_info:
         qualified = table_info["qualified"]
@@ -942,8 +1024,7 @@ def main():
                         # FreshRSS ID tracking
                         f_id = row.get("freshrss_id")
                         if not f_id or f_id == str(row["id"]):
-                            f_id = freshrss_pending_to_mark.get(url_val) or freshrss_pending_to_mark.get(str(row["id"]))
-                            if not f_id and str(row["id"]).startswith("tag:google.com"):
+                            if str(row["id"]).startswith("tag:google.com"):
                                 f_id = str(row["id"])
 
                         embed_text = f"{title}\n{clean_text}"
@@ -1005,18 +1086,14 @@ def main():
                         total_embedded += len(points_to_upsert)
                         pct = (processed / total_unindexed) * 100
                         logger.info(f"Embedded & Upserted: {processed:,} / {total_unindexed:,} ({pct:.1f}%) into Qdrant '{QDRANT_COLLECTION}'...")
-
-                        # AFTER embedding and Qdrant ingestion, mark this batch as read in FreshRSS
-                        if api_base and auth_token and batch_freshrss_ids:
-                            mark_freshrss_items_read(api_base, auth_token, csrf_token, batch_freshrss_ids)
-                            successfully_embedded_freshrss_ids.extend(batch_freshrss_ids)
+                        newly_embedded_freshrss_ids.extend(batch_freshrss_ids)
                     else:
                         logger.warning("No vectors generated for current batch. Checking embedding service...")
                         time.sleep(2)
 
         conn.close()
 
-    # 7. Fallback direct embedding if PostgreSQL was not available or empty, but unread items exist
+    # 7. Fallback direct embedding if PostgreSQL was not available, but unread items exist
     col_now = qdrant.get_collection(QDRANT_COLLECTION)
     if (col_now.points_count or 0) == 0 and unread_items and total_embedded == 0:
         logger.info(f"PostgreSQL empty or offline. Embedding {len(unread_items)} FreshRSS items directly into Qdrant...")
@@ -1041,10 +1118,18 @@ def main():
         if points:
             qdrant.upsert(collection_name=QDRANT_COLLECTION, points=points)
             logger.info(f"[✓] Directly upserted {len(points)} points into Qdrant.")
-            if api_base and auth_token and direct_marked_ids:
-                mark_freshrss_items_read(api_base, auth_token, csrf_token, direct_marked_ids)
+            newly_embedded_freshrss_ids.extend(direct_marked_ids)
 
-    # 8. Report final metrics
+    # 8. MARK AS READ IN FRESHRSS API:
+    # Mark both already-indexed articles and newly-embedded articles as read!
+    all_to_mark = list(set(already_indexed_freshrss_ids + newly_embedded_freshrss_ids))
+    if api_base and auth_token and all_to_mark:
+        logger.info(f"Marking {len(all_to_mark)} articles as READ in FreshRSS server API...")
+        mark_freshrss_items_read(api_base, auth_token, csrf_token, all_to_mark)
+    elif api_base and auth_token and not all_to_mark:
+        logger.info("No unread articles pending mark-as-read.")
+
+    # 9. Report final metrics
     final_count = qdrant.get_collection(QDRANT_COLLECTION).points_count or 0
     logger.info("=" * 70)
     logger.info(f"Sync complete. Total points in Qdrant '{QDRANT_COLLECTION}': {final_count:,}.")
