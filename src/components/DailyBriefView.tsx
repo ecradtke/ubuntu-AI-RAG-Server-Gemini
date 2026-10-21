@@ -9,118 +9,100 @@ import {
   Calendar,
   ExternalLink,
   Layers,
-  Clock
+  Clock,
+  AlertCircle
 } from 'lucide-react';
 import { SourceItem } from '../types';
 import { cleanUrl } from '../utils/ragUtils';
+import { K13Client } from '../services/k13Client';
 
 interface DailyBriefViewProps {
-  articles: SourceItem[];
+  client: K13Client;
   availableFeeds: string[];
 }
 
 export const DailyBriefView: React.FC<DailyBriefViewProps> = ({
-  articles,
+  client,
   availableFeeds
 }) => {
-  const [topic, setTopic] = useState('Gas Price Brief');
-  const [feed, setFeed] = useState('Google Alert - gas price');
+  const [topic, setTopic] = useState('Daily News Brief');
+  const [feed, setFeed] = useState('(All Feeds)');
   const [hours, setHours] = useState(24);
   const [topK, setTopK] = useState(12);
   const [format, setFormat] = useState<'markdown' | 'facebook'>('markdown');
   const [isGenerating, setIsGenerating] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  // Default pre-generated brief
   const [generatedBrief, setGeneratedBrief] = useState<{
     markdown: string;
     facebook: string;
     sources: SourceItem[];
     timestamp: string;
-  } | null>({
-    markdown: `**Gas Price Brief - last 24 hours (${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })})**
-
-1. Midwest Wholesale Spreads Tighten: Retail fuel climbed 8 cents across Minnesota and Wisconsin following scheduled refinery unit turnaround along the upper Mississippi corridor [[1]](https://www.eia.gov/petroleum/supply/weekly/midwest-gas-tightens.html).
-2. Global Crude Benchmarks Advance: Brent crude crossed $82.40 per barrel as Red Sea commercial shipping redirections increased maritime transit times [[2]](https://www.reuters.com/business/energy/crude-benchmarks-rise-red-sea-transit-times-2025.html).
-3. Statutory Fuel Tax Adjustment: Minnesota Department of Revenue implemented the 0.9 cent per gallon infrastructure indexing with metro pump prices holding steady at $3.19 [[3]](https://www.startribune.com/business/economy/minnesota-fuel-tax-adjustment-pumps-steady/600389211/).
-4. Distillate Margins Soften: North American crack spreads moderated to $19.50/bbl due to mild European industrial diesel softness, though motor gasoline demand registered 9.1 million bpd [[4]](https://www.bloomberg.com/news/articles/refining-margins-soften-distillates-gasoline-spread.html).
-
-Synopsis: Upper Midwest pump prices experienced slight seasonal pressure from regional refinery maintenance, while international maritime diversions supported crude benchmarks without creating acute supply shortages.
-
-**Sources**
-1. [Midwest Gasoline Inventories Tighten Ahead of Refinery Maintenance](https://www.eia.gov/petroleum/supply/weekly/midwest-gas-tightens.html)
-2. [Crude Benchmarks Rise as Red Sea Shipping Redirections Extend Transit Times](https://www.reuters.com/business/energy/crude-benchmarks-rise-red-sea-transit-times-2025.html)
-3. [State Fuel Tax Adjustment Takes Effect with Minimal Pump Disruption](https://www.startribune.com/business/economy/minnesota-fuel-tax-adjustment-pumps-steady/600389211/)
-4. [Global Refining Margins Contract on Weakened European Diesel Demand](https://www.bloomberg.com/news/articles/refining-margins-soften-distillates-gasoline-spread.html)`,
-    facebook: `Gas Price Brief - last 24 hours (${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })})
-
-1. Midwest Wholesale Spreads Tighten: Retail fuel climbed 8 cents across Minnesota and Wisconsin following scheduled refinery unit turnaround along the upper Mississippi corridor [1].
-2. Global Crude Benchmarks Advance: Brent crude crossed $82.40 per barrel as Red Sea commercial shipping redirections increased maritime transit times [2].
-3. Statutory Fuel Tax Adjustment: Minnesota Department of Revenue implemented the 0.9 cent per gallon infrastructure indexing with metro pump prices holding steady at $3.19 [3].
-4. Distillate Margins Soften: North American crack spreads moderated to $19.50/bbl due to mild European industrial diesel softness, though motor gasoline demand registered 9.1 million bpd [4].
-
-Synopsis: Upper Midwest pump prices experienced slight seasonal pressure from regional refinery maintenance, while international maritime diversions supported crude benchmarks without creating acute supply shortages.
-
-Sources:
-1. Midwest Gasoline Inventories Tighten Ahead of Refinery Maintenance
-   https://www.eia.gov/petroleum/supply/weekly/midwest-gas-tightens.html
-2. Crude Benchmarks Rise as Red Sea Shipping Redirections Extend Transit Times
-   https://www.reuters.com/business/energy/crude-benchmarks-rise-red-sea-transit-times-2025.html
-3. State Fuel Tax Adjustment Takes Effect with Minimal Pump Disruption
-   https://www.startribune.com/business/economy/minnesota-fuel-tax-adjustment-pumps-steady/600389211/
-4. Global Refining Margins Contract on Weakened European Diesel Demand
-   https://www.bloomberg.com/news/articles/refining-margins-soften-distillates-gasoline-spread.html`,
-    sources: articles.slice(0, 4),
-    timestamp: new Date().toLocaleTimeString()
-  });
+  } | null>(null);
 
   const handleGenerate = async () => {
     setIsGenerating(true);
-    await new Promise(r => setTimeout(r, 1200));
+    setErrorMsg(null);
 
-    // Filter feed
-    const relevant = articles.filter(a => feed === '(All Feeds)' || a.feed === feed).slice(0, 4);
-    const arts = relevant.length > 0 ? relevant : articles.slice(0, 4);
+    try {
+      // Query real articles from Qdrant via client
+      const searchRes = await client.searchArticles(
+        topic,
+        feed !== '(All Feeds)' ? feed : undefined
+      );
 
-    const head = `${topic} - last ${hours} hours (${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })})`;
+      const arts = searchRes.metas.slice(0, 4);
 
-    const summaries = arts.map((a, i) => {
-      const num = i + 1;
-      const clean = cleanUrl(a.url);
-      const headline = a.title.split(' ').slice(0, 5).join(' ');
-      const desc = a.text.slice(0, 140).trim();
-      return {
-        num,
-        headline,
-        desc,
-        title: a.title,
-        url: clean
-      };
-    });
+      if (arts.length === 0) {
+        setErrorMsg(`No articles found in collection '${client.getConfig().activeCollection}' for the specified feed/timeframe. Ensure your RSS sync is running.`);
+        setIsGenerating(false);
+        return;
+      }
 
-    const mdBody = summaries
-      .map(s => `${s.num}. ${s.headline}: ${s.desc}… [[${s.num}]](${s.url})`)
-      .join('\n');
+      const head = `${topic} - last ${hours} hours (${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })})`;
 
-    const fbBody = summaries
-      .map(s => `${s.num}. ${s.headline}: ${s.desc}… [${s.num}]`)
-      .join('\n');
+      const summaries = arts.map((a, i) => {
+        const num = i + 1;
+        const clean = cleanUrl(a.url);
+        const headline = a.title.split(' ').slice(0, 6).join(' ');
+        const desc = a.text.slice(0, 150).trim();
+        return {
+          num,
+          headline,
+          desc,
+          title: a.title,
+          url: clean
+        };
+      });
 
-    const synopsis = `Synopsis: Analysis across ${arts.length} retrieved articles indicates consolidated activity within ${topic}, highlighting structural updates and timely reporting with verified sources.`;
+      const mdBody = summaries
+        .map(s => `${s.num}. ${s.headline}: ${s.desc}… [[${s.num}]](${s.url})`)
+        .join('\n');
 
-    const mdSources = `**Sources**\n` + summaries.map(s => `${s.num}. [${s.title}](${s.url})`).join('\n');
-    const fbSources = `Sources:\n` + summaries.map(s => `${s.num}. ${s.title}\n   ${s.url}`).join('\n');
+      const fbBody = summaries
+        .map(s => `${s.num}. ${s.headline}: ${s.desc}… [${s.num}]`)
+        .join('\n');
 
-    const fullMd = `**${head}**\n\n${mdBody}\n\n${synopsis}\n\n${mdSources}`;
-    const fullFb = `${head}\n\n${fbBody}\n\n${synopsis}\n\n${fbSources}`;
+      const synopsis = `Synopsis: Analysis across ${arts.length} retrieved articles from ${client.getConfig().activeCollection} highlights recent coverage and developments for ${topic}.`;
 
-    setGeneratedBrief({
-      markdown: fullMd,
-      facebook: fullFb,
-      sources: arts,
-      timestamp: new Date().toLocaleTimeString()
-    });
-    setIsGenerating(false);
+      const mdSources = `**Sources**\n` + summaries.map(s => `${s.num}. [${s.title}](${s.url})`).join('\n');
+      const fbSources = `Sources:\n` + summaries.map(s => `${s.num}. ${s.title}\n   ${s.url}`).join('\n');
+
+      const fullMd = `**${head}**\n\n${mdBody}\n\n${synopsis}\n\n${mdSources}`;
+      const fullFb = `${head}\n\n${fbBody}\n\n${synopsis}\n\n${fbSources}`;
+
+      setGeneratedBrief({
+        markdown: fullMd,
+        facebook: fullFb,
+        sources: arts,
+        timestamp: new Date().toLocaleTimeString()
+      });
+    } catch (e: any) {
+      setErrorMsg(e.message || 'Error generating brief from Qdrant');
+    } finally {
+      setIsGenerating(false);
+    }
   };
 
   const handleCopy = () => {
@@ -155,7 +137,7 @@ Sources:
           <span>Daily News Briefing Generator (brief.py)</span>
         </h2>
         <p className="text-sm text-slate-400 mt-1">
-          Automates 24-hour news extraction from Qdrant: outputs 4 structured summaries, synopsis, and verified clickable URLs without hallucinations.
+          Automates 24-hour news extraction from your live Qdrant collection: outputs 4 structured summaries, synopsis, and verified clickable URLs without hallucinations.
         </p>
       </div>
 
@@ -169,7 +151,7 @@ Sources:
               value={topic}
               onChange={e => setTopic(e.target.value)}
               className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200"
-              placeholder="e.g. Gas Price Brief"
+              placeholder="e.g. Minnesota Politics, Gas Prices"
             />
           </div>
 
@@ -252,8 +234,16 @@ Sources:
         </div>
       </div>
 
+      {/* Error Alert */}
+      {errorMsg && (
+        <div className="p-4 rounded-xl bg-amber-950/60 border border-amber-800 text-amber-200 text-xs flex items-center gap-3">
+          <AlertCircle className="w-4 h-4 text-amber-400 flex-shrink-0" />
+          <span>{errorMsg}</span>
+        </div>
+      )}
+
       {/* Generated Output Card */}
-      {generatedBrief && (
+      {generatedBrief ? (
         <div className="p-5 rounded-2xl bg-slate-900/80 border border-slate-800 shadow-xl space-y-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
@@ -287,12 +277,17 @@ Sources:
           </div>
 
           <div className="flex items-center justify-between text-xs text-slate-500 pt-2 border-t border-slate-800">
-            <span>Sources ground verified against Qdrant collection payloads.</span>
+            <span>Sources ground verified against live Qdrant collection payloads.</span>
             <span className="flex items-center gap-1 text-slate-400">
               <Clock className="w-3.5 h-3.5" />
               Automated systemd timer: <code>brief/brief.py</code>
             </span>
           </div>
+        </div>
+      ) : (
+        <div className="p-8 rounded-2xl bg-slate-900/40 border border-dashed border-slate-800 text-center text-slate-500 text-xs space-y-2">
+          <FileText className="w-8 h-8 text-slate-600 mx-auto" />
+          <p>No brief generated yet. Configure your topic and click <strong>Generate Daily Brief</strong> to extract articles from your live Qdrant database.</p>
         </div>
       )}
     </div>

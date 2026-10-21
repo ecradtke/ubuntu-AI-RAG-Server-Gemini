@@ -16,8 +16,13 @@ __pycache__/
 # Runtime data, logs, models
 logs/
 data/
+qdrant/
 *.gguf
 *.log
+
+# Node & Build
+node_modules/
+dist/
 
 # IDE & OS
 .vscode/

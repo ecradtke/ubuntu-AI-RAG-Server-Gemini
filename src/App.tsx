@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { Header } from './components/Header';
 import { TelemetryCards } from './components/TelemetryCards';
 import { SidebarFilters } from './components/SidebarFilters';
@@ -7,11 +7,11 @@ import { ModelManagerView } from './components/ModelManagerView';
 import { DailyBriefView } from './components/DailyBriefView';
 import { ServicesView } from './components/ServicesView';
 import { ConfigView } from './components/ConfigView';
-import { ClusterConfig, ChatMessage, SourceItem } from './types';
+import { ClusterConfig, ChatMessage } from './types';
 import { K13Client } from './services/k13Client';
 
 const INITIAL_CONFIG: ClusterConfig = {
-  connectionMode: 'simulated',
+  connectionMode: 'live',
   inferenceUrl: 'http://127.0.0.1:11434',
   qdrantUrl: 'http://127.0.0.1:6333',
   activeCollection: 'rss_articles',
@@ -59,8 +59,11 @@ export const App: React.FC = () => {
   });
 
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
+  const [recordCount, setRecordCount] = useState<number>(0);
+  const [feedList, setFeedList] = useState<string[]>(['(All Feeds)']);
+  const [groupList, setGroupList] = useState<string[]>(['(All Groups)']);
 
-  // Initialize client
+  // Client instance
   const client = useMemo(() => new K13Client(config), []);
 
   useEffect(() => {
@@ -72,23 +75,45 @@ export const App: React.FC = () => {
     localStorage.setItem('k13_chat_history', JSON.stringify(messages));
   }, [messages]);
 
-  const [articles, setArticles] = useState<SourceItem[]>(() => client.getArticles());
+  // Query real Qdrant count & facets + OpenVINO health
+  const refreshClusterData = useCallback(async () => {
+    // 1. Fetch real Qdrant point count
+    const count = await client.fetchCollectionRecordCount();
+    setRecordCount(count);
+
+    // 2. Fetch real feed facets
+    const feeds = await client.fetchFacets('feed');
+    if (feeds.length > 0) {
+      setFeedList(['(All Feeds)', ...feeds.sort()]);
+    }
+
+    // 3. Fetch real group facets
+    const groups = await client.fetchFacets('group');
+    if (groups.length > 0) {
+      setGroupList(['(All Groups)', ...groups.sort()]);
+    }
+
+    // 4. Fetch live OpenVINO health
+    const health = await client.fetchHealth();
+    if (health.connected) {
+      setConfig(prev => ({
+        ...prev,
+        llmHardware: health.llmHardware,
+        embedHardware: health.embedHardware,
+        currentLlmModel: health.currentModel || prev.currentLlmModel
+      }));
+    }
+  }, [client]);
+
+  useEffect(() => {
+    refreshClusterData();
+    const interval = setInterval(refreshClusterData, 30000);
+    return () => clearInterval(interval);
+  }, [refreshClusterData]);
+
   const [services, setServices] = useState(() => client.getServices());
   const [switchState, setSwitchState] = useState(client.getSwitchStatus());
   const [embedSwitchState, setEmbedSwitchState] = useState(client.getEmbedSwitchStatus());
-
-  // Extract distinct feeds & groups
-  const feedList = useMemo(() => {
-    const set = new Set<string>(['(All Feeds)']);
-    articles.forEach(a => a.feed && set.add(a.feed));
-    return Array.from(set);
-  }, [articles]);
-
-  const groupList = useMemo(() => {
-    const set = new Set<string>(['(All Groups)']);
-    articles.forEach(a => a.group && set.add(a.group));
-    return Array.from(set);
-  }, [articles]);
 
   const handleUpdateConfig = (newConfig: Partial<ClusterConfig>) => {
     setConfig(prev => ({ ...prev, ...newConfig }));
@@ -117,7 +142,6 @@ export const App: React.FC = () => {
     setIsGenerating(true);
 
     const assistantId = `assistant-${Date.now()}`;
-    // Temporary placeholder message
     const initialAssistantMsg: ChatMessage = {
       id: assistantId,
       role: 'assistant',
@@ -136,7 +160,7 @@ export const App: React.FC = () => {
               m.id === assistantId
                 ? {
                     ...m,
-                    content: partialText || (thinking ? '💭 *Thinking…*' : 'Generating…'),
+                    content: partialText || (thinking ? '💭 *Thinking…*' : 'Searching Qdrant vectors…'),
                     stats: stats || m.stats
                   }
                 : m
@@ -148,13 +172,13 @@ export const App: React.FC = () => {
       setMessages(prev =>
         prev.map(m => (m.id === assistantId ? { ...finalMsg, id: assistantId } : m))
       );
-    } catch (err) {
+    } catch (err: any) {
       setMessages(prev =>
         prev.map(m =>
           m.id === assistantId
             ? {
                 ...m,
-                content: `⚠️ Error during OpenVINO execution: ${String(err)}`
+                content: `⚠️ Error during execution: ${err.message || String(err)}`
               }
             : m
         )
@@ -221,7 +245,7 @@ export const App: React.FC = () => {
 
             {/* Chat Workspace */}
             <div className="flex-1 flex flex-col overflow-hidden p-4 sm:p-6">
-              <TelemetryCards config={config} articleCount={articles.length} />
+              <TelemetryCards config={config} articleCount={recordCount} />
               <ChatView
                 messages={messages}
                 onSendMessage={handleSendMessage}
@@ -245,7 +269,7 @@ export const App: React.FC = () => {
         )}
 
         {activeTab === 'brief' && (
-          <DailyBriefView articles={articles} availableFeeds={feedList} />
+          <DailyBriefView client={client} availableFeeds={feedList} />
         )}
 
         {activeTab === 'services' && (

@@ -16,7 +16,7 @@ import {
   PersonaType,
   TimeframeChoice
 } from '../types';
-import { CURATED_LLM_MODELS, CURATED_EMBED_MODELS } from '../data/mockArticles';
+import { CURATED_LLM_MODELS, CURATED_EMBED_MODELS } from '../constants/models';
 
 interface SidebarFiltersProps {
   config: ClusterConfig;

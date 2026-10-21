@@ -10,8 +10,8 @@ import {
   ArrowRight,
   Info
 } from 'lucide-react';
-import { ClusterConfig } from '../types';
-import { CURATED_LLM_MODELS, CURATED_EMBED_MODELS } from '../data/mockArticles';
+import { ClusterConfig, LLMModelInfo, EmbedModelInfo } from '../types';
+import { CURATED_LLM_MODELS, CURATED_EMBED_MODELS } from '../constants/models';
 
 interface ModelManagerViewProps {
   config: ClusterConfig;
@@ -158,7 +158,7 @@ export const ModelManagerView: React.FC<ModelManagerViewProps> = ({
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          {CURATED_LLM_MODELS.map(model => {
+          {CURATED_LLM_MODELS.map((model: LLMModelInfo) => {
             const isActive = config.currentLlmModel === model.id;
             const isSwitching = switchState.state === 'loading' && switchState.model === model.id;
 
@@ -274,7 +274,7 @@ export const ModelManagerView: React.FC<ModelManagerViewProps> = ({
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {CURATED_EMBED_MODELS.map(em => {
+          {CURATED_EMBED_MODELS.map((em: EmbedModelInfo) => {
             const isActive = config.currentEmbedModel === em.id;
             return (
               <div
