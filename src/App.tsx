@@ -10,10 +10,12 @@ import { ConfigView } from './components/ConfigView';
 import { ClusterConfig, ChatMessage } from './types';
 import { K13Client } from './services/k13Client';
 
+const defaultHost = typeof window !== 'undefined' && window.location.hostname ? window.location.hostname : '127.0.0.1';
+
 const INITIAL_CONFIG: ClusterConfig = {
   connectionMode: 'live',
-  inferenceUrl: 'http://127.0.0.1:11434',
-  qdrantUrl: 'http://127.0.0.1:6333',
+  inferenceUrl: `http://${defaultHost}:11434`,
+  qdrantUrl: `http://${defaultHost}:6333`,
   activeCollection: 'rss_articles',
   activeDbEngine: 'Qdrant (Local)',
   currentLlmModel: 'OpenVINO/Phi-3.5-mini-instruct-int4-ov',
@@ -37,7 +39,17 @@ export const App: React.FC = () => {
     const saved = localStorage.getItem('k13_cluster_config');
     if (saved) {
       try {
-        return { ...INITIAL_CONFIG, ...JSON.parse(saved) };
+        const parsed = JSON.parse(saved);
+        // If accessed from a remote LAN IP or hostname, update stale 127.0.0.1/localhost to current host
+        if (defaultHost !== '127.0.0.1' && defaultHost !== 'localhost') {
+          if (parsed.inferenceUrl?.includes('127.0.0.1') || parsed.inferenceUrl?.includes('localhost')) {
+            parsed.inferenceUrl = `http://${defaultHost}:11434`;
+          }
+          if (parsed.qdrantUrl?.includes('127.0.0.1') || parsed.qdrantUrl?.includes('localhost')) {
+            parsed.qdrantUrl = `http://${defaultHost}:6333`;
+          }
+        }
+        return { ...INITIAL_CONFIG, ...parsed };
       } catch {
         return INITIAL_CONFIG;
       }
@@ -60,6 +72,10 @@ export const App: React.FC = () => {
 
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [recordCount, setRecordCount] = useState<number>(0);
+  const [dbState, setDbState] = useState<{ connected: boolean; count: number; error?: string }>({
+    connected: true,
+    count: 0
+  });
   const [feedList, setFeedList] = useState<string[]>(['(All Feeds)']);
   const [groupList, setGroupList] = useState<string[]>(['(All Groups)']);
 
@@ -77,9 +93,10 @@ export const App: React.FC = () => {
 
   // Query real Qdrant count & facets + OpenVINO health
   const refreshClusterData = useCallback(async () => {
-    // 1. Fetch real Qdrant point count
-    const count = await client.fetchCollectionRecordCount();
-    setRecordCount(count);
+    // 1. Fetch real Qdrant status & point count
+    const status = await client.fetchCollectionStatus();
+    setDbState(status);
+    setRecordCount(status.count);
 
     // 2. Fetch real feed facets
     const feeds = await client.fetchFacets('feed');
@@ -245,7 +262,12 @@ export const App: React.FC = () => {
 
             {/* Chat Workspace */}
             <div className="flex-1 flex flex-col overflow-hidden p-4 sm:p-6">
-              <TelemetryCards config={config} articleCount={recordCount} />
+              <TelemetryCards
+                config={config}
+                articleCount={recordCount}
+                dbConnected={dbState.connected}
+                dbError={dbState.error}
+              />
               <ChatView
                 messages={messages}
                 onSendMessage={handleSendMessage}

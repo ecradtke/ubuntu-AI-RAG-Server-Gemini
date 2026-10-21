@@ -46,6 +46,42 @@ export class K13Client {
   }
 
   /**
+   * Helper to perform HTTP requests to Qdrant with automatic Vite reverse-proxy fallback
+   */
+  private async qdrantFetch(path: string, options?: RequestInit): Promise<Response> {
+    const cleanPath = path.startsWith('/') ? path : `/${path}`;
+    // 1. Try configured direct URL (e.g. http://10.168.168.x:6333)
+    if (this.config.qdrantUrl) {
+      const primaryUrl = `${this.config.qdrantUrl.replace(/\/+$/, '')}${cleanPath}`;
+      try {
+        const res = await fetch(primaryUrl, options);
+        if (res.ok || (res.status >= 200 && res.status < 500)) return res;
+      } catch {
+        // Direct failed (e.g. browser CORS or stale localhost in localStorage) -> fall through to proxy
+      }
+    }
+    // 2. Fallback to Vite reverse-proxy (/api/qdrant/...)
+    return await fetch(`/api/qdrant${cleanPath}`, options);
+  }
+
+  /**
+   * Helper to perform HTTP requests to OpenVINO with automatic Vite reverse-proxy fallback
+   */
+  private async inferenceFetch(path: string, options?: RequestInit): Promise<Response> {
+    const cleanPath = path.startsWith('/') ? path : `/${path}`;
+    if (this.config.inferenceUrl) {
+      const primaryUrl = `${this.config.inferenceUrl.replace(/\/+$/, '')}${cleanPath}`;
+      try {
+        const res = await fetch(primaryUrl, options);
+        if (res.ok || (res.status >= 200 && res.status < 500)) return res;
+      } catch {
+        // Direct failed -> fall through to proxy
+      }
+    }
+    return await fetch(`/api/ov${cleanPath}`, options);
+  }
+
+  /**
    * Fetch live server health and hardware status from OpenVINO server (:11434/healthz)
    */
   public async fetchHealth(): Promise<{
@@ -55,8 +91,7 @@ export class K13Client {
     currentModel?: string;
   }> {
     try {
-      const url = `${this.config.inferenceUrl.replace(/\/+$/, '')}/healthz`;
-      const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+      const res = await this.inferenceFetch('/healthz', { signal: AbortSignal.timeout(3000) });
       if (res.ok) {
         const data = await res.json();
         return {
@@ -78,20 +113,47 @@ export class K13Client {
   }
 
   /**
+   * Fetch collection status and record count from Qdrant vector database
+   */
+  public async fetchCollectionStatus(): Promise<{
+    connected: boolean;
+    count: number;
+    status?: string;
+    error?: string;
+  }> {
+    try {
+      const res = await this.qdrantFetch(`/collections/${this.config.activeCollection}`, {
+        signal: AbortSignal.timeout(4000)
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const count = data?.result?.points_count ?? data?.result?.vectors_count ?? 0;
+        return {
+          connected: true,
+          count,
+          status: data?.result?.status || 'green'
+        };
+      }
+      return {
+        connected: false,
+        count: 0,
+        error: `HTTP ${res.status}: ${res.statusText}`
+      };
+    } catch (err: any) {
+      return {
+        connected: false,
+        count: 0,
+        error: err?.message || 'Connection refused or CORS blocked'
+      };
+    }
+  }
+
+  /**
    * Fetch total records count from Qdrant vector database
    */
   public async fetchCollectionRecordCount(): Promise<number> {
-    try {
-      const url = `${this.config.qdrantUrl.replace(/\/+$/, '')}/collections/${this.config.activeCollection}`;
-      const res = await fetch(url, { signal: AbortSignal.timeout(4000) });
-      if (res.ok) {
-        const data = await res.json();
-        return data?.result?.points_count || 0;
-      }
-    } catch {
-      // Qdrant unreachable directly
-    }
-    return 0;
+    const status = await this.fetchCollectionStatus();
+    return status.count;
   }
 
   /**
@@ -99,8 +161,7 @@ export class K13Client {
    */
   public async fetchFacets(key: 'feed' | 'group'): Promise<string[]> {
     try {
-      const url = `${this.config.qdrantUrl.replace(/\/+$/, '')}/collections/${this.config.activeCollection}/facet`;
-      const res = await fetch(url, {
+      const res = await this.qdrantFetch(`/collections/${this.config.activeCollection}/facet`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ key, limit: 100 }),
@@ -122,8 +183,7 @@ export class K13Client {
    */
   public async generateEmbedding(text: string): Promise<number[] | null> {
     try {
-      const url = `${this.config.inferenceUrl.replace(/\/+$/, '')}/api/embed`;
-      const res = await fetch(url, {
+      const res = await this.inferenceFetch('/api/embed', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -141,8 +201,7 @@ export class K13Client {
     } catch {
       // Fallback: try /api/embeddings (Ollama compatibility format)
       try {
-        const urlAlt = `${this.config.inferenceUrl.replace(/\/+$/, '')}/api/embeddings`;
-        const resAlt = await fetch(urlAlt, {
+        const resAlt = await this.inferenceFetch('/api/embeddings', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -184,8 +243,7 @@ export class K13Client {
       for (const rawUrl of detectedUrls) {
         const clean = cleanUrl(rawUrl).replace(/[/.,);]+$/, '');
         try {
-          const scrollUrl = `${this.config.qdrantUrl.replace(/\/+$/, '')}/collections/${this.config.activeCollection}/points/scroll`;
-          const scrollRes = await fetch(scrollUrl, {
+          const scrollRes = await this.qdrantFetch(`/collections/${this.config.activeCollection}/points/scroll`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -265,10 +323,9 @@ export class K13Client {
 
     if (queryVector) {
       try {
-        const queryEndpoint = `${this.config.qdrantUrl.replace(/\/+$/, '')}/collections/${this.config.activeCollection}/points/query`;
         const qFilter = buildQdrantFilter();
 
-        let searchRes = await fetch(queryEndpoint, {
+        let searchRes = await this.qdrantFetch(`/collections/${this.config.activeCollection}/points/query`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -289,7 +346,7 @@ export class K13Client {
         // Retry without filters if empty and filters were active
         if (points.length === 0 && filtersWereActive && this.config.timeframeChoice !== 'Custom range…') {
           fallbackTriggered = true;
-          const retryRes = await fetch(queryEndpoint, {
+          const retryRes = await this.qdrantFetch(`/collections/${this.config.activeCollection}/points/query`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -399,8 +456,7 @@ export class K13Client {
     let finalChunkMeta: any = {};
 
     try {
-      const chatUrl = `${this.config.inferenceUrl.replace(/\/+$/, '')}/api/chat`;
-      const res = await fetch(chatUrl, {
+      const res = await this.inferenceFetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -513,8 +569,7 @@ export class K13Client {
   public async switchLlmModel(targetModelId: string): Promise<{ success: boolean; error?: string }> {
     this.switchStatus = { state: 'loading', model: targetModelId };
     try {
-      const url = `${this.config.inferenceUrl.replace(/\/+$/, '')}/api/switch-model`;
-      const res = await fetch(url, {
+      const res = await this.inferenceFetch('/api/switch-model', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: targetModelId }),
@@ -541,8 +596,7 @@ export class K13Client {
   public async switchEmbedModel(targetModelId: string): Promise<{ success: boolean; error?: string }> {
     this.embedSwitchStatus = { state: 'loading', model: targetModelId };
     try {
-      const url = `${this.config.inferenceUrl.replace(/\/+$/, '')}/api/switch-embed-model`;
-      const res = await fetch(url, {
+      const res = await this.inferenceFetch('/api/switch-embed-model', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: targetModelId }),

@@ -81,7 +81,7 @@ if ! sudo apt-get update -qq; then
   warn "Continuing with the package lists apt already has. Fix or disable the broken repo when you can: sudo apt update"
 fi
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git curl ca-certificates python3 python3-venv python3-dev python3-pip \
-  build-essential libpq-dev postgresql-client unzip jq util-linux >/dev/null
+  build-essential libpq-dev postgresql-client unzip jq util-linux nodejs npm >/dev/null
 sudo usermod -aG render,video "$USER_NAME" || true     # NPU/GPU device access for your own shells
 
 # ---- 3. Folders ---------------------------------------------------------------------
@@ -177,7 +177,7 @@ echo
 ok "Install finished. Next steps:"
 echo "  - Status:        ./scripts/k13ctl.sh status"
 echo "  - Watch models:  ./scripts/k13ctl.sh logs openvino   (first start downloads the LLM and embedding model)"
-echo "  - Web portal:    http://$(hostname -I | awk '{print $1}'):$(env_get WEB_PORT 8501)"
+echo "  - Web portal:    http://$(hostname -I | awk '{print $1}'):$(env_get WEB_PORT 3000)"
 $WITH_SHARE   || echo "  - Network share: ./scripts/setup-share.sh      (shares the backup folder over SMB)"
 $WITH_BACKUPS || echo "  - Backups:       ./scripts/install-cron.sh     (nightly 04:00 / 04:15)"
 echo "  (Log out and back in once so your shell picks up the render/video groups.)"

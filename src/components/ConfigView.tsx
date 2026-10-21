@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Settings, Shield, HardDrive, Terminal, FileCode, Check, Copy } from 'lucide-react';
+import { Settings, Shield, HardDrive, Terminal, FileCode, Check, Copy, Globe, RefreshCw } from 'lucide-react';
 import { ClusterConfig } from '../types';
 
 interface ConfigViewProps {
@@ -14,7 +14,7 @@ const ENV_VARIABLES = [
   { key: 'EMBED_DEVICE', val: 'NPU', desc: 'Hardware target for vector embeddings (Intel NPU /dev/accel/accel0)' },
   { key: 'OV_HOST', val: '127.0.0.1', desc: 'Bind address for OpenVINO FastAPI server' },
   { key: 'OV_PORT', val: '11434', desc: 'Ollama- and OpenAI-compatible inference port' },
-  { key: 'QDRANT_BIND', val: '127.0.0.1', desc: 'Local bind address for native Qdrant service' },
+  { key: 'QDRANT_BIND', val: '0.0.0.0', desc: 'Bind address for native Qdrant service (0.0.0.0 binds all interfaces for LAN access)' },
   { key: 'QDRANT_PORT', val: '6333', desc: 'Qdrant HTTP REST API port' },
   { key: 'QDRANT_COLLECTION', val: 'rss_articles', desc: 'Primary news & RSS article collection' },
   { key: 'RAG_CONTEXT_TOKEN_BUDGET', val: '8000', desc: 'Max token budget for retrieved excerpts to protect GPU KV cache' },
@@ -30,6 +30,78 @@ const ENV_VARIABLES = [
 
 export const ConfigView: React.FC<ConfigViewProps> = ({ config, onUpdateConfig }) => {
   const [copied, setCopied] = useState(false);
+  const [testResult, setTestResult] = useState<{
+    testing: boolean;
+    tested?: boolean;
+    qdrantStatus?: { ok: boolean; msg: string; count?: number };
+    ovStatus?: { ok: boolean; msg: string };
+  }>({ testing: false });
+
+  const runConnectionTest = async () => {
+    setTestResult({ testing: true, tested: true });
+    // Test Qdrant
+    let qOk = false;
+    let qMsg = '';
+    let count = 0;
+    try {
+      let res = await fetch(`${config.qdrantUrl.replace(/\/+$/, '')}/collections/${config.activeCollection}`, {
+        signal: AbortSignal.timeout(3000)
+      }).catch(() => null);
+
+      if (!res || !res.ok) {
+        res = await fetch(`/api/qdrant/collections/${config.activeCollection}`, {
+          signal: AbortSignal.timeout(3000)
+        }).catch(() => null);
+      }
+
+      if (res && res.ok) {
+        const data = await res.json();
+        qOk = true;
+        count = data?.result?.points_count ?? data?.result?.vectors_count ?? 0;
+        qMsg = `Reachable (${count.toLocaleString()} points in '${config.activeCollection}')`;
+      } else if (res) {
+        qMsg = `HTTP ${res.status}: ${res.statusText}`;
+      } else {
+        qMsg = 'Port 6333 unreachable or blocked';
+      }
+    } catch (e: any) {
+      qMsg = e?.message || 'Connection failed';
+    }
+
+    // Test OpenVINO
+    let ovOk = false;
+    let ovMsg = '';
+    try {
+      let res = await fetch(`${config.inferenceUrl.replace(/\/+$/, '')}/healthz`, {
+        signal: AbortSignal.timeout(3000)
+      }).catch(() => null);
+
+      if (!res || !res.ok) {
+        res = await fetch('/api/ov/healthz', {
+          signal: AbortSignal.timeout(3000)
+        }).catch(() => null);
+      }
+
+      if (res && res.ok) {
+        const data = await res.json();
+        ovOk = true;
+        ovMsg = `Online (${data.llm_hardware || 'GPU'} / ${data.embed_hardware || 'NPU'})`;
+      } else if (res) {
+        ovMsg = `HTTP ${res.status}`;
+      } else {
+        ovMsg = 'Port 11434 unreachable';
+      }
+    } catch (e: any) {
+      ovMsg = e?.message || 'Connection failed';
+    }
+
+    setTestResult({
+      testing: false,
+      tested: true,
+      qdrantStatus: { ok: qOk, msg: qMsg, count },
+      ovStatus: { ok: ovOk, msg: ovMsg }
+    });
+  };
 
   const rawEnvText = ENV_VARIABLES.map(e => `${e.key}=${e.val}`).join('\n');
 
@@ -91,10 +163,108 @@ export const ConfigView: React.FC<ConfigViewProps> = ({ config, onUpdateConfig }
           >
             <div className="font-bold text-xs">Live Local Endpoints</div>
             <div className="text-[11px] text-slate-400 mt-0.5">
-              Direct connection to 127.0.0.1:11434 and 127.0.0.1:6333 on this host
+              Direct connection to :11434 (OpenVINO) and :6333 (Qdrant)
             </div>
           </button>
         </div>
+
+        {/* Live Service URLs Configuration */}
+        {config.connectionMode === 'live' && (
+          <div className="mt-4 pt-4 border-t border-slate-800/80 space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                <Globe className="w-3.5 h-3.5 text-sky-400" />
+                <span>Client Endpoint URLs (for browser access)</span>
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  const h = window.location.hostname || '127.0.0.1';
+                  onUpdateConfig({
+                    inferenceUrl: `http://${h}:11434`,
+                    qdrantUrl: `http://${h}:6333`
+                  });
+                }}
+                className="text-[11px] text-sky-400 hover:text-sky-300 flex items-center gap-1 transition"
+                title="Reset to current browser hostname"
+              >
+                <RefreshCw className="w-3 h-3" />
+                <span>Reset to {window.location.hostname || '127.0.0.1'}</span>
+              </button>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+              <div>
+                <label className="block text-[11px] text-slate-400 mb-1">OpenVINO Inference Server URL</label>
+                <input
+                  type="text"
+                  value={config.inferenceUrl}
+                  onChange={e => onUpdateConfig({ inferenceUrl: e.target.value })}
+                  placeholder="http://127.0.0.1:11434"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-slate-200 font-mono focus:outline-none focus:border-sky-500"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] text-slate-400 mb-1">Qdrant Vector Database URL</label>
+                <input
+                  type="text"
+                  value={config.qdrantUrl}
+                  onChange={e => onUpdateConfig({ qdrantUrl: e.target.value })}
+                  placeholder="http://127.0.0.1:6333"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-slate-200 font-mono focus:outline-none focus:border-sky-500"
+                />
+              </div>
+            </div>
+
+            {/* Test Connection Button & Status */}
+            <div className="pt-2 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 border-t border-slate-800/60">
+              <button
+                type="button"
+                onClick={runConnectionTest}
+                disabled={testResult.testing}
+                className="px-3 py-1.5 rounded-lg bg-indigo-600/30 hover:bg-indigo-600/50 border border-indigo-500/50 text-indigo-200 text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${testResult.testing ? 'animate-spin' : ''}`} />
+                <span>{testResult.testing ? 'Testing Endpoints...' : 'Test Cluster Endpoints'}</span>
+              </button>
+
+              {testResult.tested && (
+                <div className="flex flex-wrap items-center gap-2 text-xs">
+                  <span className={`px-2.5 py-1 rounded-full font-mono flex items-center gap-1.5 ${
+                    testResult.qdrantStatus?.ok
+                      ? 'bg-emerald-950/80 border border-emerald-600/60 text-emerald-300'
+                      : 'bg-rose-950/80 border border-rose-600/60 text-rose-300'
+                  }`}>
+                    <span className={`w-1.5 h-1.5 rounded-full ${testResult.qdrantStatus?.ok ? 'bg-emerald-400' : 'bg-rose-400'}`} />
+                    <span>Qdrant: {testResult.qdrantStatus?.msg}</span>
+                  </span>
+
+                  <span className={`px-2.5 py-1 rounded-full font-mono flex items-center gap-1.5 ${
+                    testResult.ovStatus?.ok
+                      ? 'bg-sky-950/80 border border-sky-600/60 text-sky-300'
+                      : 'bg-rose-950/80 border border-rose-600/60 text-rose-300'
+                  }`}>
+                    <span className={`w-1.5 h-1.5 rounded-full ${testResult.ovStatus?.ok ? 'bg-sky-400' : 'bg-rose-400'}`} />
+                    <span>OpenVINO: {testResult.ovStatus?.msg}</span>
+                  </span>
+                </div>
+              )}
+            </div>
+
+            {/* Architecture guidance */}
+            <div className="p-3 rounded-xl bg-slate-950 border border-slate-800/90 text-[11px] text-slate-400 space-y-1.5">
+              <div className="font-semibold text-slate-200 flex items-center gap-1.5">
+                <Shield className="w-3.5 h-3.5 text-indigo-400" />
+                <span>Host IP & .env Guidelines</span>
+              </div>
+              <p>
+                <strong>Do you need to set the host IP in <code>.env</code>?</strong> No. In <code>.env</code>, <code>QDRANT_BIND=0.0.0.0</code> automatically listens on all network interfaces, and backend scripts (like <code>sync_freshrss.py</code>) reach Qdrant locally at <code>127.0.0.1:6333</code>.
+              </p>
+              <p>
+                <strong>Web Portal LAN Access:</strong> The portal now includes built-in reverse-proxying via Vite (<code>/api/qdrant</code> and <code>/api/ov</code>). Even if accessed from another device on your network without setting an IP, requests seamlessly reach your K13 server. If you prefer direct connections, simply click &ldquo;Reset to hostname&rdquo; above.
+              </p>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Environment Variables Table */}

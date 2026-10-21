@@ -5,9 +5,11 @@ import { ClusterConfig } from '../types';
 interface TelemetryCardsProps {
   config: ClusterConfig;
   articleCount: number;
+  dbConnected?: boolean;
+  dbError?: string;
 }
 
-export const TelemetryCards: React.FC<TelemetryCardsProps> = ({ config, articleCount }) => {
+export const TelemetryCards: React.FC<TelemetryCardsProps> = ({ config, articleCount, dbConnected = true, dbError }) => {
   const modelShortName = config.currentLlmModel.split('/').pop() || config.currentLlmModel;
 
   return (
@@ -36,13 +38,25 @@ export const TelemetryCards: React.FC<TelemetryCardsProps> = ({ config, articleC
           <Database className="w-4 h-4 text-indigo-400" />
         </div>
         <div className="flex items-center gap-2">
-          <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 shadow-[0_0_8px_#34d399]" />
+          <span
+            className={`w-2.5 h-2.5 rounded-full ${
+              dbConnected
+                ? 'bg-emerald-400 shadow-[0_0_8px_#34d399]'
+                : 'bg-rose-500 shadow-[0_0_8px_#f43f5e] animate-pulse'
+            }`}
+          />
           <span className="text-base sm:text-lg font-bold text-slate-100">
-            {articleCount.toLocaleString()} Records
+            {dbConnected
+              ? `${articleCount.toLocaleString()} Records`
+              : 'Disconnected'}
           </span>
         </div>
-        <div className="text-[11px] text-slate-500 mt-1 font-mono">
-          Cosine Similarity Index :6333
+        <div className="text-[11px] text-slate-400 mt-1 font-mono truncate" title={dbError || ''}>
+          {dbConnected
+            ? articleCount === 0
+              ? 'Collection empty (run sync to embed)'
+              : 'Cosine Index :6333'
+            : (dbError ? `Error: ${dbError.slice(0, 32)}` : 'Port 6333 unreachable')}
         </div>
       </div>
 

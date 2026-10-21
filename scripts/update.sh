@@ -22,6 +22,7 @@ fi
 
 "$BASE_DIR/scripts/install.sh" --units-only
 sudo systemctl restart k13-web.service
+sudo systemctl try-restart k13-openvino.service
 sudo systemctl try-restart k13-qdrant.service
 sudo systemctl restart k13-rss-sync.timer 2>/dev/null || true
 ok "Updated. Check with: ./scripts/k13ctl.sh status"

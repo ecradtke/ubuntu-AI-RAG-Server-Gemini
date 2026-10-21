@@ -8,6 +8,10 @@ Provides Ollama-compatible and OpenAI-compatible endpoints:
 """
 import os
 import sys
+
+# Ensure Intel Level Zero driver initializes NPU (accel0) in addition to GPU
+os.environ.setdefault("ZE_INIT_ALL_DRIVER_TYPES_ENABLE", "1")
+
 import asyncio
 import time
 import json
@@ -16,6 +20,7 @@ import logging
 from typing import List, Optional, Dict, Any, Union
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 import numpy as np
@@ -86,11 +91,15 @@ def load_llm(model_id: str):
 def load_embed(model_id: str):
     global embed_model, embed_tokenizer, active_embed_device, current_embed_repo
     with embed_lock:
-        logger.info(f"Loading embedding model {model_id} on {EMBED_DEVICE}...")
+        target_device = EMBED_DEVICE.upper()
+        logger.info(f"Loading embedding model {model_id} on {target_device}...")
         try:
             import openvino as ov
             from transformers import AutoTokenizer
             core = ov.Core()
+            available = core.available_devices
+            logger.info(f"OpenVINO available devices: {available}")
+            
             from huggingface_hub import snapshot_download
             model_path = snapshot_download(repo_id=model_id, local_dir=os.path.join(MODELS_DIR, model_id.replace("/", "_")))
             
@@ -104,23 +113,53 @@ def load_embed(model_id: str):
                 ov_m = OVModelForFeatureExtraction.from_pretrained(model_path, export=True)
                 model = ov_m.model
 
-            try:
-                compiled = core.compile_model(model, EMBED_DEVICE)
-                active_embed_device = EMBED_DEVICE
-            except Exception as e_npu:
-                logger.warning(f"Could not load embeddings on {EMBED_DEVICE} ({e_npu}), falling back to CPU...")
+            compiled = None
+            if target_device == "NPU":
+                if "NPU" not in available:
+                    logger.warning(
+                        f"NPU requested, but 'NPU' is not found in OpenVINO available devices ({available}). "
+                        "Falling back to CPU. (Check Intel NPU driver and /dev/accel/accel0 permissions)."
+                    )
+                else:
+                    logger.info("Reshaping embedding model to static shape (1, 512) for Intel NPU compilation...")
+                    try:
+                        shapes = {inp.get_any_name(): [1, 512] for inp in model.inputs}
+                        model.reshape(shapes)
+                        logger.info("Model reshaped to static (1, 512). Compiling on NPU...")
+                        compiled = core.compile_model(model, "NPU")
+                        active_embed_device = "NPU"
+                        logger.info(f"[✓] Embeddings {model_id} successfully compiled and active on NPU")
+                    except Exception as e_npu:
+                        logger.warning(f"Could not compile embeddings on NPU ({e_npu}), falling back to CPU...")
+                        compiled = None
+
+            if compiled is None:
+                # CPU fallback: reset to dynamic shapes if reshaped
+                try:
+                    dyn_shapes = {inp.get_any_name(): [-1, -1] for inp in model.inputs}
+                    model.reshape(dyn_shapes)
+                except Exception:
+                    pass
                 compiled = core.compile_model(model, "CPU")
                 active_embed_device = "CPU"
+                logger.info(f"[✓] Embeddings {model_id} active on fallback CPU")
 
             embed_model = compiled
             embed_tokenizer = tok
             current_embed_repo = model_id
-            logger.info(f"[✓] Embeddings {model_id} active on {active_embed_device}")
         except Exception as e:
-            logger.error(f"Failed to load embed model {model_id}: {e}")
+            logger.error(f"Failed to load embed model {model_id}: {e}", exc_info=True)
 
 
 app = FastAPI(title="K13 OpenVINO Server")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")
@@ -233,9 +272,22 @@ def embed_endpoint(req: EmbedReq):
 
     with embed_lock:
         results = []
+        is_static = (active_embed_device == "NPU")
+        pad_mode = "max_length" if is_static else True
+
         for text in texts:
-            inputs = embed_tokenizer(text, padding=True, truncation=True, max_length=512, return_tensors="np")
-            out = embed_model(dict(inputs))
+            inputs = embed_tokenizer(text, padding=pad_mode, truncation=True, max_length=512, return_tensors="np")
+            feed_dict = {}
+            for inp in embed_model.inputs:
+                name = inp.get_any_name()
+                if name in inputs:
+                    feed_dict[name] = inputs[name]
+                elif name == "token_type_ids":
+                    feed_dict[name] = np.zeros((1, 512) if is_static else inputs["input_ids"].shape, dtype=inputs["input_ids"].dtype)
+                elif name in inputs:
+                    feed_dict[name] = inputs[name]
+
+            out = embed_model(feed_dict)
             # mean pooling
             token_embs = out[0]
             mask = np.expand_dims(inputs["attention_mask"], -1)
