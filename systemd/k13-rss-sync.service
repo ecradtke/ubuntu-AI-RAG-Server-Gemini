@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 User=@USER@
-WorkingDirectory=@REPO@/rss
+WorkingDirectory=@REPO@
 ExecStart=/bin/bash @REPO@/scripts/run-rss-sync.sh
 # the first run can drain a large backlog
 TimeoutStartSec=infinity

@@ -91,15 +91,19 @@ for d in "$OV_MODELS_DIR" "$STORAGE" "$SNAPSHOTS" "$K13_DATA_DIR" /opt/k13/qdran
 done
 sudo chown -R "$USER_NAME:$USER_NAME" "$K13_DATA_DIR" "$OV_MODELS_DIR" "$STORAGE" "$SNAPSHOTS" /opt/k13 "$BASE_DIR/logs"
 
-# ---- 4. Python environments -----------------------------------------------------------
-log "Creating the web/RSS Python environment (.venv)..."
+# ---- 4. Python & Node environments ---------------------------------------------------
+log "Creating the RSS Python environment (.venv)..."
 python3 -m venv "$BASE_DIR/.venv"
 "$BASE_DIR/.venv/bin/pip" install -q --upgrade pip
-"$BASE_DIR/.venv/bin/pip" install -q -r "$BASE_DIR/web/requirements.txt" || {
-  warn "pip install failed; retrying without the binary psycopg2 wheel..."
-  grep -v psycopg2 "$BASE_DIR/web/requirements.txt" | "$BASE_DIR/.venv/bin/pip" install -q -r /dev/stdin
-  "$BASE_DIR/.venv/bin/pip" install -q psycopg2 || die "Could not install psycopg2 (needs libpq-dev, installed above)."
+"$BASE_DIR/.venv/bin/pip" install -q psycopg2-binary qdrant-client requests || {
+  warn "pip install failed; retrying with standard psycopg2..."
+  "$BASE_DIR/.venv/bin/pip" install -q psycopg2 qdrant-client requests || warn "Could not install psycopg2"
 }
+
+log "Installing Node.js packages and building React portal..."
+if command -v npm >/dev/null 2>&1; then
+  (cd "$BASE_DIR" && npm install -q && npm run build || true)
+fi
 
 OV_PY="$(env_get OPENVINO_PYTHON)"
 if [[ -n "$OV_PY" ]]; then
