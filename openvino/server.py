@@ -58,10 +58,61 @@ current_embed_repo = DEFAULT_EMBED_REPO
 model_switch_status: Dict[str, Any] = {"state": "idle", "model": DEFAULT_LLM_REPO, "error": None}
 embed_switch_status: Dict[str, Any] = {"state": "idle", "model": DEFAULT_EMBED_REPO, "error": None}
 
+# Automatic mapping from raw unquantized Hugging Face repositories to verified OpenVINO INT4 IR models
+RAW_TO_OPENVINO_INT4_MAP: Dict[str, str] = {
+    # Qwen 2.5 3B variants (general instruction & reasoning)
+    "qwen/qwen2.5-3b-instruct": "srang992/Qwen-2.5-3B-Instruct-ov-INT4",
+    "qwen/qwen2.5-3b": "srang992/Qwen-2.5-3B-Instruct-ov-INT4",
+    "qwen2.5-3b-instruct": "srang992/Qwen-2.5-3B-Instruct-ov-INT4",
+    "qwen2.5-3b": "srang992/Qwen-2.5-3B-Instruct-ov-INT4",
+    # Qwen 2.5 Coder 3B variants
+    "qwen/qwen2.5-coder-3b-instruct": "OpenVINO/Qwen2.5-Coder-3B-Instruct-int4-ov",
+    "qwen/qwen2.5-coder-3b": "OpenVINO/Qwen2.5-Coder-3B-Instruct-int4-ov",
+    "qwen2.5-coder-3b-instruct": "OpenVINO/Qwen2.5-Coder-3B-Instruct-int4-ov",
+    "qwen2.5-coder-3b": "OpenVINO/Qwen2.5-Coder-3B-Instruct-int4-ov",
+    # Qwen 2.5 7B variants
+    "qwen/qwen2.5-7b-instruct": "OpenVINO/Qwen2.5-7B-Instruct-int4-ov",
+    "qwen/qwen2.5-7b": "OpenVINO/Qwen2.5-7B-Instruct-int4-ov",
+    "qwen2.5-7b-instruct": "OpenVINO/Qwen2.5-7B-Instruct-int4-ov",
+    # Qwen 3 variants
+    "qwen/qwen3-4b": "OpenVINO/Qwen3-4B-int4-ov",
+    "qwen3-4b": "OpenVINO/Qwen3-4B-int4-ov",
+    "qwen/qwen3-8b": "OpenVINO/Qwen3-8B-int4-ov",
+    "qwen3-8b": "OpenVINO/Qwen3-8B-int4-ov",
+    # Llama 3.2 3B & 3.1 8B variants
+    "meta-llama/llama-3.2-3b-instruct": "OpenVINO/Llama-3.2-3B-Instruct-int4-ov",
+    "meta-llama/llama-3.2-3b": "OpenVINO/Llama-3.2-3B-Instruct-int4-ov",
+    "llama-3.2-3b-instruct": "OpenVINO/Llama-3.2-3B-Instruct-int4-ov",
+    "llama-3.2-3b": "OpenVINO/Llama-3.2-3B-Instruct-int4-ov",
+    "meta-llama/llama-3.1-8b-instruct": "OpenVINO/Llama-3.1-8B-Instruct-int4-ov",
+    "meta-llama/llama-3.1-8b": "OpenVINO/Llama-3.1-8B-Instruct-int4-ov",
+    "llama-3.1-8b-instruct": "OpenVINO/Llama-3.1-8B-Instruct-int4-ov",
+    # Mistral variants
+    "mistralai/mistral-7b-instruct-v0.3": "OpenVINO/Mistral-7B-Instruct-v0.3-int4-ov",
+    "mistralai/mistral-7b-instruct": "OpenVINO/Mistral-7B-Instruct-v0.3-int4-ov",
+    # Microsoft Phi variants
+    "microsoft/phi-3.5-mini-instruct": "OpenVINO/Phi-3.5-mini-instruct-int4-ov",
+    "microsoft/phi-4-mini-instruct": "OpenVINO/Phi-4-mini-instruct-int4-ov",
+    # Google Gemma variants
+    "google/gemma-3-4b-it": "OpenVINO/gemma-3-4b-it-int4-ov",
+    "google/gemma-3-12b-it": "OpenVINO/gemma-3-12b-it-int4-ov",
+}
+
 
 def load_llm(model_id: str):
     global llm_pipeline, active_llm_device, current_llm_repo, model_switch_status
     with llm_lock:
+        raw_key = model_id.strip()
+        norm_key = raw_key.lower()
+        if norm_key in RAW_TO_OPENVINO_INT4_MAP:
+            mapped_repo = RAW_TO_OPENVINO_INT4_MAP[norm_key]
+            logger.info(
+                f"[Auto-Map] '{raw_key}' is an unquantized raw Hugging Face model (~6.5 GB). "
+                f"Auto-resolving to native OpenVINO INT4 repository: '{mapped_repo}' (~1.9 GB)"
+            )
+            model_id = mapped_repo
+            model_switch_status["model"] = model_id
+
         logger.info(f"Loading LLM {model_id} on {INFERENCE_DEVICE}...")
         old_pipe = llm_pipeline
         old_repo = current_llm_repo
@@ -94,16 +145,67 @@ def load_llm(model_id: str):
                     raise RuntimeError(f"Hugging Face repository '{model_id}' not found. Please verify the model ID spelling.") from e_dl
                 raise RuntimeError(f"Failed downloading {model_id}: {e_dl}") from e_dl
 
-            # 2. Release previous pipeline memory before compiling new model onto GPU
+            # 2. Check for OpenVINO IR files (openvino_model.xml)
+            has_ov_xml = os.path.exists(os.path.join(model_path, "openvino_model.xml"))
+            ov_int4_sub = os.path.join(model_path, "ov_int4")
+            has_sub_xml = os.path.exists(os.path.join(ov_int4_sub, "openvino_model.xml"))
+
+            if not has_ov_xml and not has_sub_xml:
+                # The repository does not have pre-converted openvino_model.xml.
+                # Check if optimum-cli can quantize to INT4 on the fly!
+                import shutil
+                import subprocess
+
+                optimum_bin = shutil.which("optimum-cli")
+                if not optimum_bin:
+                    py_dir = os.path.dirname(sys.executable)
+                    cand = os.path.join(py_dir, "optimum-cli")
+                    if os.path.exists(cand):
+                        optimum_bin = cand
+
+                if optimum_bin:
+                    logger.info(f"Model {model_id} lacks openvino_model.xml. Auto-quantizing to INT4 with optimum-cli...")
+                    model_switch_status["stage"] = "quantizing"
+                    os.makedirs(ov_int4_sub, exist_ok=True)
+                    cmd = [
+                        optimum_bin, "export", "openvino",
+                        "--model", model_path,
+                        "--task", "text-generation-with-past",
+                        "--weight-format", "int4",
+                        "--group-size", "128",
+                        "--sym",
+                        ov_int4_sub
+                    ]
+                    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                    if res.returncode == 0 and os.path.exists(os.path.join(ov_int4_sub, "openvino_model.xml")):
+                        logger.info(f"[✓] Quantization succeeded for {model_id} -> {ov_int4_sub}")
+                        model_path = ov_int4_sub
+                    else:
+                        logger.warning(f"optimum-cli export failed:\n{res.stdout[-1000:]}")
+                        raise RuntimeError(
+                            f"Model '{model_id}' is a raw unquantized Hugging Face model (~6.5 GB in BF16) without OpenVINO IR files. "
+                            "Unquantized models exceed the Intel Lunar Lake GPU memory ceiling (~6.8 GB) and fail during VRAM allocation. "
+                            "Please use the pre-quantized OpenVINO INT4 model 'srang992/Qwen-2.5-3B-Instruct-ov-INT4' (~1.9 GB) or 'OpenVINO/Qwen2.5-Coder-3B-Instruct-int4-ov'."
+                        )
+                else:
+                    raise RuntimeError(
+                        f"Model '{model_id}' is a raw unquantized PyTorch model without OpenVINO IR files (missing 'openvino_model.xml'). "
+                        "Unquantized weights exceed the Intel GPU VRAM limit (~6.8 GB). "
+                        "Please use an OpenVINO INT4 repository such as 'srang992/Qwen-2.5-3B-Instruct-ov-INT4' (~1.9 GB) or 'OpenVINO/Qwen2.5-Coder-3B-Instruct-int4-ov'."
+                    )
+            elif has_sub_xml:
+                model_path = ov_int4_sub
+
+            # 3. Release previous pipeline memory before compiling new model onto GPU
             model_switch_status["stage"] = "compiling"
             llm_pipeline = None
             del old_pipe
             gc.collect()
 
-            # 3. Compile onto GPU (or fallback to CPU if allowed)
+            # 4. Compile onto GPU (or fallback to CPU if allowed)
             target_device = INFERENCE_DEVICE
             try:
-                logger.info(f"Compiling LLMPipeline for {model_id} on {target_device}...")
+                logger.info(f"Compiling LLMPipeline for {model_id} on {target_device} from {model_path}...")
                 pipe = ov_genai.LLMPipeline(model_path, target_device)
                 active_llm_device = target_device
             except Exception as e_gpu:

@@ -247,26 +247,63 @@ export const ModelManagerView: React.FC<ModelManagerViewProps> = ({
         </div>
 
         {/* Custom Hugging Face Repo Input */}
-        <div className="p-4 rounded-xl bg-slate-900/60 border border-slate-800 flex flex-col sm:flex-row items-center gap-3">
-          <div className="flex-1 w-full">
-            <label className="block text-xs font-medium text-slate-300 mb-1">
-              Custom OpenVINO Hugging Face Repo
-            </label>
-            <input
-              type="text"
-              placeholder="e.g. OpenVINO/Qwen2.5-Coder-7B-Instruct-int4-ov"
-              value={customModelRepo}
-              onChange={e => setCustomModelRepo(e.target.value)}
-              className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 font-mono focus:outline-none focus:border-indigo-500"
-            />
+        <div className="p-4 rounded-xl bg-slate-900/60 border border-slate-800 space-y-3">
+          <div className="flex flex-col sm:flex-row items-center gap-3">
+            <div className="flex-1 w-full">
+              <label className="block text-xs font-medium text-slate-300 mb-1">
+                Custom OpenVINO Hugging Face Repo
+              </label>
+              <input
+                type="text"
+                placeholder="e.g. srang992/Qwen-2.5-3B-Instruct-ov-INT4 or OpenVINO/Qwen3-4B-int4-ov"
+                value={customModelRepo}
+                onChange={e => setCustomModelRepo(e.target.value)}
+                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 font-mono focus:outline-none focus:border-indigo-500"
+              />
+            </div>
+            <button
+              onClick={() => customModelRepo.trim() && onSwitchLlmModel(customModelRepo.trim())}
+              disabled={!customModelRepo.trim() || switchState.state === 'loading'}
+              className="w-full sm:w-auto mt-auto sm:mt-5 px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-xs font-semibold transition"
+            >
+              Load Custom Repo
+            </button>
           </div>
-          <button
-            onClick={() => customModelRepo.trim() && onSwitchLlmModel(customModelRepo.trim())}
-            disabled={!customModelRepo.trim() || switchState.state === 'loading'}
-            className="w-full sm:w-auto mt-auto sm:mt-5 px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 text-xs font-semibold transition"
-          >
-            Load Custom Repo
-          </button>
+
+          {(() => {
+            const norm = customModelRepo.trim().toLowerCase();
+            let suggestion: { repo: string; label: string } | null = null;
+            if (norm.includes('qwen2.5-3b-instruct') || norm === 'qwen/qwen2.5-3b' || norm === 'qwen2.5-3b') {
+              suggestion = { repo: 'srang992/Qwen-2.5-3B-Instruct-ov-INT4', label: 'Qwen2.5 3B Instruct INT4 (~1.9 GB)' };
+            } else if (norm.includes('qwen2.5-coder-3b')) {
+              suggestion = { repo: 'OpenVINO/Qwen2.5-Coder-3B-Instruct-int4-ov', label: 'Qwen2.5 Coder 3B INT4 (~1.9 GB)' };
+            } else if (norm.includes('qwen2.5-7b')) {
+              suggestion = { repo: 'OpenVINO/Qwen2.5-7B-Instruct-int4-ov', label: 'Qwen2.5 7B Instruct INT4 (~4.3 GB)' };
+            } else if (norm.includes('llama-3.2-3b')) {
+              suggestion = { repo: 'OpenVINO/Llama-3.2-3B-Instruct-int4-ov', label: 'Llama 3.2 3B INT4 (~2.0 GB)' };
+            }
+
+            if (!suggestion) return null;
+
+            return (
+              <div className="text-xs text-amber-300 bg-amber-950/40 border border-amber-800/60 rounded-lg p-2.5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2">
+                <span>
+                  ⚡ <strong>Raw BF16 model detected</strong>: Unquantized models (~6.5 GB) exceed Intel GPU VRAM during compilation. Switch to the native OpenVINO INT4 model:
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setCustomModelRepo(suggestion!.repo)}
+                  className="px-2.5 py-1 bg-amber-600 hover:bg-amber-500 text-white rounded text-[11px] font-mono font-bold whitespace-nowrap"
+                >
+                  Use {suggestion.label}
+                </button>
+              </div>
+            );
+          })()}
+
+          <p className="text-[11px] text-slate-500">
+            Note: Intel Arc GPU requires <strong>INT4 OpenVINO IR</strong> models (<code className="text-slate-400 font-mono">-int4-ov</code>). Raw unquantized FP16/BF16 weights exceed the ~6.8 GB VRAM budget. If you enter a raw Hugging Face ID, the server will automatically resolve it to its INT4 OpenVINO equivalent.
+          </p>
         </div>
       </div>
 

@@ -2,6 +2,23 @@ import { LLMModelInfo, EmbedModelInfo, SystemService } from '../types';
 
 export const CURATED_LLM_MODELS: LLMModelInfo[] = [
   {
+    id: 'srang992/Qwen-2.5-3B-Instruct-ov-INT4',
+    name: 'Qwen2.5 3B Instruct ⭐',
+    params: '3B',
+    size: '~1.9 GB',
+    description: 'High-speed 3B general instruction model quantized to INT4 with NNCF. Fits in ~1.9 GB GPU VRAM.',
+    recommended: true,
+    contextWindow: '32k'
+  },
+  {
+    id: 'OpenVINO/Qwen2.5-Coder-3B-Instruct-int4-ov',
+    name: 'Qwen2.5 Coder 3B',
+    params: '3B',
+    size: '~1.9 GB',
+    description: 'Official Intel OpenVINO INT4 conversion for coding and structured reasoning.',
+    contextWindow: '32k'
+  },
+  {
     id: 'OpenVINO/Phi-3.5-mini-instruct-int4-ov',
     name: 'Phi-3.5 Mini',
     params: '3.8B',
