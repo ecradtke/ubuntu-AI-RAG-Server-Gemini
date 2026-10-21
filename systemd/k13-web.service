@@ -1,0 +1,15 @@
+[Unit]
+Description=K13 web portal (Streamlit)
+After=network-online.target k13-qdrant.service k13-openvino.service
+Wants=network-online.target k13-qdrant.service k13-openvino.service
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@REPO@/web
+ExecStart=/bin/bash @REPO@/scripts/run-web.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
