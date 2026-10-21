@@ -38,25 +38,68 @@ EMBED_DIMS = int(os.environ.get("EMBED_DIMS", "768"))
 if "small" in EMBED_MODEL:
     EMBED_DIMS = 384
 
-PG_HOST = os.environ.get("PG_HOST") or os.environ.get("POSTGRES_HOST") or "127.0.0.1"
-PG_PORT = int(os.environ.get("PG_PORT") or os.environ.get("POSTGRES_PORT") or "5432")
-PG_USER = os.environ.get("PG_USER") or os.environ.get("POSTGRES_USER") or "freshrss"
-PG_PASSWORD = os.environ.get("PG_PASSWORD") or os.environ.get("POSTGRES_PASSWORD") or ""
-PG_DBNAME = os.environ.get("PG_DBNAME") or os.environ.get("POSTGRES_DB") or "fetch42"
+# Fallback: directly parse .env if present so python sees variables even without wrapper
+def _load_env_file():
+    candidates = [
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"),
+        "/opt/fetch42/.env",
+        ".env"
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            k = k.strip()
+                            v = v.strip().strip("'\"").rstrip("\r")
+                            if k and (k not in os.environ or not os.environ[k]):
+                                os.environ[k] = v
+            except Exception as e:
+                logger.debug(f"Could not parse {path}: {e}")
+            break
 
-FRESHRSS_BASE_URL = (os.environ.get("FRESHRSS_BASE_URL") or os.environ.get("FRESHRSS_URL") or "").rstrip("/")
-FRESHRSS_USER = os.environ.get("FRESHRSS_USER") or ""
-FRESHRSS_API_PASS = os.environ.get("FRESHRSS_API_PASS") or os.environ.get("FRESHRSS_PASSWORD") or ""
+_load_env_file()
+
+def get_env_opt(*keys: str, default: str = "") -> str:
+    for k in keys:
+        v = (os.environ.get(k) or "").strip()
+        if v:
+            return v
+    return default
+
+PG_HOST = get_env_opt("PG_HOST", "POSTGRES_HOST", "NAS_HOST", "NAS_IP", "DB_HOST", default="127.0.0.1")
+PG_PORT = int(get_env_opt("PG_PORT", "POSTGRES_PORT", default="5432"))
+PG_USER = get_env_opt("PG_USER", "POSTGRES_USER", "DB_USER", default="freshrss")
+PG_PASSWORD = get_env_opt(
+    "PG_PASS", "PG_PASSWORD", "PGPASSWORD",
+    "POSTGRES_PASSWORD", "POSTGRES_PASS",
+    "DB_PASS", "DB_PASSWORD", "FRESHRSS_DB_PASS",
+    default=""
+)
+PG_DBNAME = get_env_opt("PG_DB", "PG_DBNAME", "POSTGRES_DB", default="fetch42")
+
+FRESHRSS_BASE_URL = get_env_opt("FRESHRSS_BASE_URL", "FRESHRSS_URL", default="").rstrip("/")
+if not FRESHRSS_BASE_URL and PG_HOST != "127.0.0.1":
+    FRESHRSS_BASE_URL = f"http://{PG_HOST}:8080"
+FRESHRSS_USER = get_env_opt("FRESHRSS_USER", default="")
+FRESHRSS_API_PASS = get_env_opt("FRESHRSS_API_PASS", "FRESHRSS_PASSWORD", default="")
 
 
 def connect_postgres(db: str):
     """Attempts PostgreSQL connection with fallback credentials."""
+    pwd_display = f"YES ({len(PG_PASSWORD)} chars)" if PG_PASSWORD else "NO (EMPTY!)"
+    logger.info(f"Connecting to PostgreSQL at {PG_HOST}:{PG_PORT}/{db} as user '{PG_USER}', password={pwd_display}...")
     try:
         conn = psycopg2.connect(
             host=PG_HOST,
             port=PG_PORT,
             user=PG_USER,
-            password=PG_PASSWORD,
+            password=PG_PASSWORD or None,
             dbname=db,
             connect_timeout=10
         )

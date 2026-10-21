@@ -8,9 +8,11 @@ ENV_FILE="${ENV_FILE:-${BASE_DIR}/.env}"
 env_get() {                 # env_get KEY [default]  -> value from the real environment, then .env, then default
   local v="${!1:-}"
   if [[ -z "$v" && -f "$ENV_FILE" ]]; then
-    v="$(grep -E "^[[:space:]]*$1=" "$ENV_FILE" | tail -n1 | cut -d= -f2- || true)"
+    v="$(grep -E "^[[:space:]]*$1[[:space:]]*=" "$ENV_FILE" | tail -n1 | cut -d= -f2- || true)"
     v="${v%"${v##*[![:space:]]}"}"; v="${v#"${v%%[![:space:]]*}"}"       # trim whitespace
-    v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"                    # strip quotes
+    if [[ "$v" =~ ^\"(.*)\"$ ]] || [[ "$v" =~ ^\'(.*)\'$ ]]; then
+      v="${BASH_REMATCH[1]}"
+    fi
     v="${v%$'\r'}"
   fi
   printf '%s' "${v:-${2:-}}"
