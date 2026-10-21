@@ -1,70 +1,76 @@
 #!/usr/bin/env python3
 """Sync FreshRSS -> PostgreSQL -> OpenVINO Embeddings (NPU) -> Qdrant.
 
-Automatically detects PostgreSQL tables across all schemas, detects if Qdrant
-is empty or missing, auto-creates public.articles if needed, resets vector_indexed flags,
-and rebuilds vector points with full progress logging.
+Automatically detects PostgreSQL tables across all schemas, dynamically adapts
+to whatever columns exist in the articles table (title, url/link, feed/source,
+category/group, published_at/date, content/summary), detects if Qdrant is empty
+or missing, auto-creates public.articles if needed, resets vector_indexed,
+and continuously embeds unindexed articles via OpenVINO into Qdrant.
 """
+
 import os
 import sys
 import time
-import re
 import uuid
+import re
 import logging
+from typing import List, Dict, Any, Optional
+
 import requests
+import psycopg2
+import psycopg2.extras
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Distance, VectorParams, PointStruct, PayloadSchemaType
 
-try:
-    import psycopg2
-    import psycopg2.extras
-except ImportError:
-    psycopg2 = None
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] k13-rss-sync: %(message)s"
+)
+logger = logging.getLogger("k13-rss-sync")
 
-try:
-    from qdrant_client import QdrantClient
-    from qdrant_client.models import Distance, VectorParams, PointStruct, PayloadSchemaType
-except ImportError:
-    QdrantClient = None
+# Environment & Config
+QDRANT_URL = os.environ.get("QDRANT_URL", "http://127.0.0.1:6333")
+QDRANT_COLLECTION = os.environ.get("QDRANT_COLLECTION", "rss_articles")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] k13-rss-sync: %(message)s")
-logger = logging.getLogger("rss-sync")
+EMBEDDING_HOST = os.environ.get("EMBEDDING_HOST", "http://127.0.0.1:11434")
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "BAAI/bge-base-en-v1.5")
+EMBED_DIMS = int(os.environ.get("EMBED_DIMS", "768"))
+if "small" in EMBED_MODEL:
+    EMBED_DIMS = 384
 
-# Environment variables
-FRESHRSS_BASE_URL = os.getenv("FRESHRSS_BASE_URL", "").rstrip("/")
-FRESHRSS_USER = os.getenv("FRESHRSS_USER", "")
-FRESHRSS_API_PASS = os.getenv("FRESHRSS_API_PASS", "")
+PG_HOST = os.environ.get("PG_HOST") or os.environ.get("POSTGRES_HOST") or "127.0.0.1"
+PG_PORT = int(os.environ.get("PG_PORT") or os.environ.get("POSTGRES_PORT") or "5432")
+PG_USER = os.environ.get("PG_USER") or os.environ.get("POSTGRES_USER") or "freshrss"
+PG_PASSWORD = os.environ.get("PG_PASSWORD") or os.environ.get("POSTGRES_PASSWORD") or ""
+PG_DBNAME = os.environ.get("PG_DBNAME") or os.environ.get("POSTGRES_DB") or "fetch42"
 
-PG_HOST = os.getenv("PG_HOST") or os.getenv("NAS_HOST", "127.0.0.1")
-PG_PORT = int(os.getenv("PG_PORT", "5432"))
-PG_DB = os.getenv("PG_DB", "fetch42")
-PG_USER = os.getenv("PG_USER", "postgres")
-PG_PASS = os.getenv("PG_PASS", "")
-
-EMBEDDING_HOST = os.getenv("EMBEDDING_HOST") or os.getenv("OPENVINO_URL", "http://127.0.0.1:11434").rstrip("/")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-base-en-v1.5")
-EMBED_DIMS = 384 if "small" in EMBED_MODEL else 768
-
-QDRANT_HOST = os.getenv("QDRANT_HOST", "127.0.0.1")
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "rss_articles")
+FRESHRSS_BASE_URL = (os.environ.get("FRESHRSS_BASE_URL") or os.environ.get("FRESHRSS_URL") or "").rstrip("/")
+FRESHRSS_USER = os.environ.get("FRESHRSS_USER") or ""
+FRESHRSS_API_PASS = os.environ.get("FRESHRSS_API_PASS") or os.environ.get("FRESHRSS_PASSWORD") or ""
 
 
-def get_pg_connection(dbname=None):
-    if not psycopg2:
-        logger.warning("psycopg2 is not installed in the Python environment.")
-        return None
-    db = dbname or PG_DB
+def connect_postgres(db: str):
+    """Attempts PostgreSQL connection with fallback credentials."""
     try:
         conn = psycopg2.connect(
-            host=PG_HOST, port=PG_PORT, dbname=db, user=PG_USER, password=PG_PASS, connect_timeout=10
+            host=PG_HOST,
+            port=PG_PORT,
+            user=PG_USER,
+            password=PG_PASSWORD,
+            dbname=db,
+            connect_timeout=10
         )
+        conn.autocommit = False
         return conn
     except Exception as e:
         logger.warning(f"PostgreSQL connection to {PG_HOST}:{PG_PORT}/{db} failed: {e}")
         return None
 
 
-def detect_and_prep_pg_table(conn, dbname):
-    """Detects existing article/entry tables in PostgreSQL or auto-creates public.articles."""
+def detect_and_prep_pg_table(conn, dbname: str) -> Optional[Dict[str, Any]]:
+    """Detects existing article/entry tables in PostgreSQL, inspects columns dynamically,
+    and ensures vector_indexed column and index exist.
+    """
     with conn.cursor() as cur:
         # Check all non-system tables
         cur.execute("""
@@ -82,7 +88,7 @@ def detect_and_prep_pg_table(conn, dbname):
         table_type = "articles"
 
         # 1. Search for custom article candidate names
-        for cand in ("articles", "rss_articles", "rss_items", "feed_entries"):
+        for cand in ("rss_articles", "articles", "rss_items", "feed_entries"):
             for s, t in all_tables:
                 if t.lower() == cand:
                     target_schema = s
@@ -156,7 +162,79 @@ def detect_and_prep_pg_table(conn, dbname):
         """)
         conn.commit()
 
-        # Find companion feed and category tables if FreshRSS entry table
+        # Add index on vector_indexed if not exists for fast batch filtering
+        safe_idx_name = f"idx_vec_{target_table[:20]}"
+        try:
+            cur.execute(f"CREATE INDEX IF NOT EXISTS {safe_idx_name} ON {qualified} (vector_indexed);")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+
+        # Dynamic column inspection to construct tailored queries
+        cur.execute("""
+            SELECT column_name, data_type 
+            FROM information_schema.columns 
+            WHERE table_schema = %s AND table_name = %s;
+        """, (target_schema, target_table))
+        raw_cols = cur.fetchall()
+        col_types = {row[0].lower(): row[1].lower() for row in raw_cols}
+        cols = set(col_types.keys())
+        logger.info(f"Inspected columns for {qualified}: {sorted(cols)}")
+
+        # 1. Determine ID column
+        id_candidates = ("id", "guid", "article_id", "entry_id", "link", "url")
+        id_col = next((c for c in id_candidates if c in cols), sorted(cols)[0])
+        id_is_int = any(k in col_types.get(id_col, "") for k in ("int", "serial"))
+
+        # 2. Determine Title expression
+        title_candidates = ("title", "headline", "subject", "name")
+        title_col = next((c for c in title_candidates if c in cols), None)
+        title_expr = f'COALESCE("{title_col}", \'Untitled\')' if title_col else "'Untitled'"
+
+        # 3. Determine URL expression
+        url_candidates = ("url", "link", "canonical", "permalink", "guid")
+        url_col = next((c for c in url_candidates if c in cols), None)
+        url_expr = f'COALESCE("{url_col}", \'\')' if url_col else "''"
+
+        # 4. Determine Feed expression
+        feed_candidates = ("feed", "feed_name", "feed_title", "source", "source_name", "channel", "site_name", "author", "id_feed", "feed_id")
+        feed_col = next((c for c in feed_candidates if c in cols), None)
+        if feed_col:
+            feed_expr = f'COALESCE("{feed_col}"::text, \'FreshRSS\')'
+        else:
+            feed_expr = "'FreshRSS'"
+
+        # 5. Determine Category expression
+        cat_candidates = ("category", "category_name", "group", "tag", "tags", "categories", "topic", "section")
+        cat_col = next((c for c in cat_candidates if c in cols), None)
+        if cat_col:
+            category_expr = f'COALESCE("{cat_col}"::text, \'General\')'
+        else:
+            category_expr = "'General'"
+
+        # 6. Determine Published timestamp expression (normalize to Unix Epoch seconds)
+        pub_candidates = ("published_at", "pub_date", "pubdate", "date", "published", "created_at", "timestamp", "crawl_time")
+        pub_col = next((c for c in pub_candidates if c in cols), None)
+        if pub_col:
+            pub_dtype = col_types.get(pub_col, "")
+            if "int" in pub_dtype:
+                pub_expr = f'CASE WHEN "{pub_col}" > 100000000000 THEN ("{pub_col}" / 1000)::bigint ELSE COALESCE("{pub_col}"::bigint, EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)::bigint) END'
+            elif "timestamp" in pub_dtype or "date" in pub_dtype:
+                pub_expr = f'EXTRACT(EPOCH FROM COALESCE("{pub_col}", CURRENT_TIMESTAMP))::bigint'
+            else:
+                pub_expr = f'EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)::bigint'
+        else:
+            pub_expr = 'EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)::bigint'
+
+        # 7. Determine Content expression
+        content_candidates = ("content", "body", "text", "summary", "description", "raw_content", "details")
+        content_col = next((c for c in content_candidates if c in cols), None)
+        if content_col:
+            content_expr = f'COALESCE("{content_col}", \'\')'
+        else:
+            content_expr = f'{title_expr}'
+
+        # FreshRSS companion tables if relevant
         feed_table = None
         category_table = None
         if table_type == "freshrss":
@@ -172,9 +250,16 @@ def detect_and_prep_pg_table(conn, dbname):
             "table": target_table,
             "qualified": qualified,
             "type": table_type,
+            "id_col": id_col,
+            "id_is_int": id_is_int,
+            "title_expr": title_expr,
+            "url_expr": url_expr,
+            "feed_expr": feed_expr,
+            "category_expr": category_expr,
+            "pub_expr": pub_expr,
+            "content_expr": content_expr,
             "feed_table": feed_table,
             "category_table": category_table,
-            "is_empty": len(all_tables) == 0
         }
 
 
@@ -250,7 +335,8 @@ def fetch_freshrss_items(auth_token, limit=500, max_pages=3):
     return items
 
 
-def get_embedding(text):
+def get_embedding(text: str) -> Optional[List[float]]:
+    """Single-item embedding fallback."""
     for endpoint, payload in [
         ("/api/embed", {"model": EMBED_MODEL, "input": text[:2000]}),
         ("/api/embeddings", {"model": EMBED_MODEL, "prompt": text[:2000]})
@@ -259,136 +345,178 @@ def get_embedding(text):
             r = requests.post(f"{EMBEDDING_HOST}{endpoint}", json=payload, timeout=60)
             if r.status_code == 200:
                 data = r.json()
-                if "embeddings" in data and data["embeddings"]:
-                    return data["embeddings"][0]
-                if "embedding" in data:
+                if "embedding" in data and len(data["embedding"]) > 0:
                     return data["embedding"]
+                elif "embeddings" in data and len(data["embeddings"]) > 0:
+                    return data["embeddings"][0]
         except Exception:
-            continue
+            pass
     return None
+
+
+def get_embeddings_batch(texts: List[str]) -> List[Optional[List[float]]]:
+    """Generates embeddings for a batch of texts using OpenVINO server.
+    Leverages batch endpoint if available, with robust single-item fallback.
+    """
+    if not texts:
+        return []
+    truncated = [t[:2000] for t in texts]
+
+    # Try batch POST first
+    for endpoint in ("/api/embed", "/api/embeddings"):
+        try:
+            r = requests.post(
+                f"{EMBEDDING_HOST}{endpoint}",
+                json={"model": EMBED_MODEL, "input": truncated},
+                timeout=120
+            )
+            if r.status_code == 200:
+                data = r.json()
+                embs = data.get("embeddings")
+                if embs and len(embs) == len(texts):
+                    return embs
+        except Exception:
+            pass
+
+    # Fallback to single requests
+    return [get_embedding(t) for t in texts]
+
+
+def ensure_qdrant_collection(qdrant: QdrantClient) -> bool:
+    """Verifies Qdrant collection exists and matches EMBED_DIMS. Recreates if missing or mismatched.
+    Returns True if the collection was newly created/recreated (indicating a full rebuild is required).
+    """
+    needs_rebuild = False
+    try:
+        collections = qdrant.get_collections().collections
+        exists = any(c.name == QDRANT_COLLECTION for c in collections)
+        if exists:
+            info = qdrant.get_collection(QDRANT_COLLECTION)
+            vector_size = 0
+            if hasattr(info.config.params, "vectors"):
+                v_param = info.config.params.vectors
+                if hasattr(v_param, "size"):
+                    vector_size = v_param.size
+                elif isinstance(v_param, dict) and "" in v_param:
+                    vector_size = v_param[""].size
+
+            if vector_size != EMBED_DIMS:
+                logger.warning(f"Collection '{QDRANT_COLLECTION}' dimension mismatch ({vector_size} != {EMBED_DIMS}). Recreating...")
+                qdrant.delete_collection(QDRANT_COLLECTION)
+                exists = False
+                needs_rebuild = True
+            elif (info.points_count or 0) == 0:
+                logger.info(f"Collection '{QDRANT_COLLECTION}' exists but is empty (0 points). Marking for rebuild...")
+                needs_rebuild = True
+        else:
+            logger.info(f"Collection '{QDRANT_COLLECTION}' does not exist in Qdrant. Rebuilding...")
+            needs_rebuild = True
+
+        if not exists:
+            logger.info(f"Creating collection '{QDRANT_COLLECTION}' ({EMBED_DIMS} dims, Cosine)...")
+            qdrant.create_collection(
+                collection_name=QDRANT_COLLECTION,
+                vectors_config=VectorParams(size=EMBED_DIMS, distance=Distance.COSINE),
+            )
+            for field in ("published_at", "feed", "group", "url"):
+                schema_type = PayloadSchemaType.INTEGER if field == "published_at" else PayloadSchemaType.KEYWORD
+                qdrant.create_payload_index(
+                    collection_name=QDRANT_COLLECTION,
+                    field_name=field,
+                    field_schema=schema_type,
+                    wait=True
+                )
+    except Exception as e:
+        logger.error(f"Error checking Qdrant status: {e}")
+        needs_rebuild = False
+
+    return needs_rebuild
 
 
 def main():
     logger.info("Starting FreshRSS -> Postgres -> Qdrant sync run...")
-    if not QdrantClient:
-        logger.error("qdrant_client is not installed in the python environment.")
-        sys.exit(1)
 
-    qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=30.0)
-
-    # 1. Connect to PostgreSQL
-    conn = get_pg_connection(PG_DB)
-    active_db = PG_DB
-    table_info = None
-
-    if conn:
-        table_info = detect_and_prep_pg_table(conn, active_db)
-        # If active_db was completely empty, check if database 'freshrss' exists and has tables
-        if table_info["is_empty"] and active_db != "freshrss":
-            alt_conn = get_pg_connection("freshrss")
-            if alt_conn:
-                alt_info = detect_and_prep_pg_table(alt_conn, "freshrss")
-                if not alt_info["is_empty"]:
-                    logger.info("Found populated article tables in database 'freshrss'. Switching to 'freshrss'.")
-                    conn.close()
-                    conn = alt_conn
-                    active_db = "freshrss"
-                    table_info = alt_info
-                else:
-                    alt_conn.close()
-
-        logger.info(f"Connected to PostgreSQL database '{active_db}', using table {table_info['qualified']}.")
-
-    # 2. Check Qdrant collection status & determine if rebuild is needed
-    rebuild_needed = False
+    # 1. Connect to Qdrant
     try:
-        cols_resp = qdrant.get_collections()
-        col_names = [c.name for c in cols_resp.collections]
-
-        if QDRANT_COLLECTION not in col_names:
-            logger.info(f"Collection '{QDRANT_COLLECTION}' does not exist in Qdrant. Rebuilding...")
-            rebuild_needed = True
-        else:
-            col_info = qdrant.get_collection(QDRANT_COLLECTION)
-            cur_dim = col_info.config.params.vectors.size
-            cur_count = col_info.points_count or 0
-
-            if cur_dim != EMBED_DIMS:
-                logger.warning(
-                    f"Vector dimension mismatch in '{QDRANT_COLLECTION}': expected {EMBED_DIMS}, got {cur_dim}. Recreating collection."
-                )
-                qdrant.delete_collection(QDRANT_COLLECTION)
-                rebuild_needed = True
-            elif cur_count == 0:
-                logger.info(f"Collection '{QDRANT_COLLECTION}' exists but is empty (0 points). Rebuild needed.")
-                rebuild_needed = True
-            else:
-                logger.info(f"Qdrant collection '{QDRANT_COLLECTION}' is healthy with {cur_count:,} points.")
-
-        if rebuild_needed:
-            logger.info(f"Creating collection '{QDRANT_COLLECTION}' ({EMBED_DIMS} dims, Cosine)...")
-            qdrant.create_collection(
-                collection_name=QDRANT_COLLECTION,
-                vectors_config=VectorParams(size=EMBED_DIMS, distance=Distance.COSINE)
-            )
-            # Create payload indexes for fast filtered retrieval
-            qdrant.create_payload_index(QDRANT_COLLECTION, "published_at", PayloadSchemaType.INTEGER)
-            qdrant.create_payload_index(QDRANT_COLLECTION, "feed", PayloadSchemaType.KEYWORD)
-            qdrant.create_payload_index(QDRANT_COLLECTION, "group", PayloadSchemaType.KEYWORD)
-            qdrant.create_payload_index(QDRANT_COLLECTION, "url", PayloadSchemaType.KEYWORD)
-
-            # Reset vector_indexed = FALSE in PostgreSQL so all items are re-embedded
-            if conn and table_info:
-                with conn.cursor() as cur:
-                    logger.info(
-                        f"Resetting vector_indexed=FALSE on PostgreSQL table {table_info['qualified']} to trigger full re-embedding..."
-                    )
-                    cur.execute(f"UPDATE {table_info['qualified']} SET vector_indexed = FALSE;")
-                    conn.commit()
-
+        qdrant = QdrantClient(url=QDRANT_URL, timeout=15)
+        # Test connection
+        qdrant.get_collections()
     except Exception as e:
-        logger.error(f"Error checking Qdrant status: {e}")
+        logger.error(f"Could not connect to Qdrant at {QDRANT_URL}: {e}")
         sys.exit(1)
 
-    # 3. Pull newest articles from FreshRSS API into Postgres
-    auth = get_freshrss_auth()
-    new_items = []
-    if auth:
-        fetch_limit = 500 if rebuild_needed else 150
-        max_p = 5 if rebuild_needed else 2
-        new_items = fetch_freshrss_items(auth, limit=fetch_limit, max_pages=max_p)
-        logger.info(f"Fetched {len(new_items)} articles from FreshRSS API.")
+    # 2. Connect to PostgreSQL
+    conn = None
+    table_info = None
+    for db in (PG_DBNAME, "freshrss", "postgres"):
+        conn = connect_postgres(db)
+        if conn:
+            table_info = detect_and_prep_pg_table(conn, db)
+            if table_info:
+                logger.info(f"Connected to PostgreSQL database '{db}', using table {table_info['qualified']}.")
+                break
+            else:
+                conn.close()
+                conn = None
 
-        if new_items and conn and table_info and table_info["type"] == "articles":
+    # 3. Check Qdrant collection status; rebuild if missing or empty
+    needs_rebuild = ensure_qdrant_collection(qdrant)
+
+    if needs_rebuild and conn and table_info:
+        qualified = table_info["qualified"]
+        logger.info(f"Resetting vector_indexed=FALSE on PostgreSQL table {qualified} to trigger full re-embedding...")
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"UPDATE {qualified} SET vector_indexed = FALSE;")
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Failed to reset vector_indexed on {qualified}: {e}")
+
+    # 4. Ingest new articles from FreshRSS API if credentials are provided
+    auth_token = get_freshrss_auth()
+    new_items = []
+    if auth_token:
+        logger.info("Fetching latest articles from FreshRSS API...")
+        new_items = fetch_freshrss_items(auth_token, limit=200, max_pages=3)
+        logger.info(f"Retrieved {len(new_items)} items from FreshRSS.")
+
+        # Insert new items into PostgreSQL if available
+        if conn and table_info and new_items:
+            qualified = table_info["qualified"]
+            id_col = table_info["id_col"]
             with conn.cursor() as cur:
                 inserted_count = 0
                 for it in new_items:
                     try:
                         cur.execute(f"""
-                            INSERT INTO {table_info['qualified']} (id, title, url, feed, category, published_at, content, vector_indexed)
+                            INSERT INTO {qualified} ({id_col}, title, url, feed, category, published_at, content, vector_indexed)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE)
-                            ON CONFLICT (id) DO UPDATE SET
-                                title = EXCLUDED.title,
-                                url = EXCLUDED.url,
-                                feed = EXCLUDED.feed,
-                                category = EXCLUDED.category,
-                                published_at = EXCLUDED.published_at,
-                                content = EXCLUDED.content
-                            RETURNING id;
-                        """, (it["id"], it["title"], it["url"], it["feed"], it["group"], it["published_at"], it["text"]))
-                        if cur.fetchone():
+                            ON CONFLICT ({id_col}) DO NOTHING;
+                        """, (
+                            it["id"] or it["url"],
+                            it["title"],
+                            it["url"],
+                            it["feed"],
+                            it["group"],
+                            it["published_at"],
+                            it["text"]
+                        ))
+                        if cur.rowcount > 0:
                             inserted_count += 1
-                    except Exception as ins_err:
-                        logger.warning(f"Insert error: {ins_err}")
+                    except Exception:
                         conn.rollback()
                         break
                 conn.commit()
                 if inserted_count > 0:
-                    logger.info(f"Inserted / refreshed {inserted_count} articles from FreshRSS into PostgreSQL table {table_info['qualified']}.")
+                    logger.info(f"Inserted {inserted_count} new articles from FreshRSS into {qualified}.")
 
-    # 4. Fetch unindexed records from PostgreSQL and embed into Qdrant
+    # 5. Fetch unindexed records from PostgreSQL and embed into Qdrant
     if conn and table_info:
         qualified = table_info["qualified"]
+        id_col = table_info["id_col"]
+        id_is_int = table_info["id_is_int"]
+
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             cur.execute(f"SELECT COUNT(*) FROM {qualified} WHERE vector_indexed IS FALSE OR vector_indexed IS NULL;")
             total_unindexed = cur.fetchone()[0]
@@ -398,83 +526,120 @@ def main():
                 batch_size = 50
                 processed = 0
 
-                while True:
-                    if table_info["type"] == "freshrss" and table_info["feed_table"]:
-                        cur.execute(f"""
-                            SELECT e.id, e.title, COALESCE(e.link, '') as url,
-                                   COALESCE(f.name, 'FreshRSS') as feed,
-                                   COALESCE(c.name, 'General') as category,
-                                   EXTRACT(EPOCH FROM COALESCE(e.date, CURRENT_TIMESTAMP))::bigint as published_at,
-                                   COALESCE(e.content, '') as content
-                            FROM {qualified} e
-                            LEFT JOIN {table_info['feed_table']} f ON e.id_feed = f.id
-                            LEFT JOIN {table_info['category_table'] or "f"} c ON f.category = c.id
-                            WHERE e.vector_indexed IS FALSE OR e.vector_indexed IS NULL
-                            LIMIT {batch_size};
-                        """)
-                    else:
-                        cur.execute(f"""
-                            SELECT id, title, url, feed, category, published_at, content
-                            FROM {qualified} 
-                            WHERE vector_indexed IS FALSE OR vector_indexed IS NULL 
-                            LIMIT {batch_size};
-                        """)
+                # Build dynamic SELECT query based on inspected columns
+                if table_info["type"] == "freshrss" and table_info["feed_table"]:
+                    select_sql = f"""
+                        SELECT e.{id_col} AS id,
+                               e.title AS title,
+                               COALESCE(e.link, '') AS url,
+                               COALESCE(f.name, 'FreshRSS') AS feed,
+                               COALESCE(c.name, 'General') AS category,
+                               EXTRACT(EPOCH FROM COALESCE(e.date, CURRENT_TIMESTAMP))::bigint AS published_at,
+                               COALESCE(e.content, '') AS content
+                        FROM {qualified} e
+                        LEFT JOIN {table_info['feed_table']} f ON e.id_feed = f.id
+                        LEFT JOIN {table_info['category_table'] or "f"} c ON f.category = c.id
+                        WHERE e.vector_indexed IS FALSE OR e.vector_indexed IS NULL
+                        LIMIT {batch_size};
+                    """
+                else:
+                    select_sql = f"""
+                        SELECT "{id_col}" AS id,
+                               {table_info['title_expr']} AS title,
+                               {table_info['url_expr']} AS url,
+                               {table_info['feed_expr']} AS feed,
+                               {table_info['category_expr']} AS category,
+                               {table_info['pub_expr']} AS published_at,
+                               {table_info['content_expr']} AS content
+                        FROM {qualified}
+                        WHERE vector_indexed IS FALSE OR vector_indexed IS NULL
+                        LIMIT {batch_size};
+                    """
 
+                while True:
+                    cur.execute(select_sql)
                     rows = cur.fetchall()
                     if not rows:
                         break
 
-                    points_to_upsert = []
-                    processed_ids = []
+                    texts_to_embed = []
+                    row_metadata = []
 
                     for row in rows:
                         title = row.get("title") or "Untitled"
-                        text = row.get("content") or row.get("text") or row.get("summary") or title
-                        clean_text = re.sub(r"<[^>]+>", " ", text).strip()
-                        url_val = row.get("url") or row.get("link") or ""
-                        feed_val = row.get("feed") or row.get("source") or "News"
-                        group_val = row.get("category") or row.get("group") or "General"
+                        text = row.get("content") or title
+                        clean_text = re.sub(r"<[^>]+>", " ", text).strip() or title
+                        url_val = row.get("url") or ""
+                        feed_val = row.get("feed") or "News"
+                        group_val = row.get("category") or "General"
                         pub_time = row.get("published_at") or int(time.time())
 
-                        # Generate vector embedding on NPU
-                        vec = get_embedding(f"{title}\n{clean_text}")
+                        embed_text = f"{title}\n{clean_text}"
+                        texts_to_embed.append(embed_text)
+
+                        row_metadata.append({
+                            "raw_id": row["id"],
+                            "title": title,
+                            "url": url_val,
+                            "feed": feed_val,
+                            "group": group_val,
+                            "published_at": int(pub_time),
+                            "text": clean_text
+                        })
+
+                    # Batch embedding via OpenVINO server
+                    vectors = get_embeddings_batch(texts_to_embed)
+
+                    points_to_upsert = []
+                    processed_ids = []
+
+                    for meta, vec in zip(row_metadata, vectors):
                         if vec and len(vec) == EMBED_DIMS:
-                            row_id = str(row.get("id") or url_val)
-                            pt_id = str(uuid.uuid5(uuid.NAMESPACE_URL, row_id))
+                            pt_id = str(uuid.uuid5(uuid.NAMESPACE_URL, str(meta["raw_id"] or meta["url"])))
                             payload = {
-                                "title": title,
-                                "url": url_val,
-                                "feed": feed_val,
-                                "group": group_val,
-                                "published_at": int(pub_time),
-                                "text": clean_text
+                                "title": meta["title"],
+                                "url": meta["url"],
+                                "feed": meta["feed"],
+                                "group": meta["group"],
+                                "published_at": meta["published_at"],
+                                "text": meta["text"]
                             }
                             points_to_upsert.append(PointStruct(id=pt_id, vector=vec, payload=payload))
-                            processed_ids.append(row["id"])
+                            processed_ids.append(meta["raw_id"])
 
                     if points_to_upsert:
                         qdrant.upsert(collection_name=QDRANT_COLLECTION, points=points_to_upsert)
 
                         # Mark batch as indexed in PostgreSQL
+                        if id_is_int:
+                            clean_ids = [int(x) for x in processed_ids if str(x).isdigit()]
+                        else:
+                            clean_ids = [str(x) for x in processed_ids]
+
                         with conn.cursor() as update_cur:
                             update_cur.execute(f"""
                                 UPDATE {qualified} SET vector_indexed = TRUE 
-                                WHERE id = ANY(%s);
-                            """, (processed_ids,))
+                                WHERE "{id_col}" = ANY(%s);
+                            """, (clean_ids,))
                             conn.commit()
 
                         processed += len(points_to_upsert)
-                        logger.info(f"Rebuilding database: {processed:,} / {total_unindexed:,} articles indexed into Qdrant...")
+                        pct = (processed / total_unindexed) * 100
+                        logger.info(f"Rebuilding database: {processed:,} / {total_unindexed:,} ({pct:.1f}%) articles indexed into Qdrant...")
+                    else:
+                        logger.warning("No vectors generated for current batch. Checking embedding service...")
+                        time.sleep(2)
 
         conn.close()
 
-    # 5. Direct embed fallback if PostgreSQL was not configured or empty, but FreshRSS items exist
+    # 6. Direct embed fallback if PostgreSQL was not configured or empty, but FreshRSS items exist
     col_now = qdrant.get_collection(QDRANT_COLLECTION)
     if (col_now.points_count or 0) == 0 and new_items:
         logger.info(f"Embedding {len(new_items)} FreshRSS items directly into Qdrant...")
+        texts = [f"{it['title']}\n{it['text']}" for it in new_items]
+        vectors = get_embeddings_batch(texts)
         points = []
-        for it in new_items:
-            vec = get_embedding(f"{it['title']}\n{it['text']}")
+        for it, vec in zip(new_items, vectors):
             if vec and len(vec) == EMBED_DIMS:
                 pt_id = str(uuid.uuid5(uuid.NAMESPACE_URL, it["id"] or it["url"]))
                 points.append(PointStruct(id=pt_id, vector=vec, payload={
