@@ -82,6 +82,7 @@ export interface LLMModelInfo {
   default?: boolean;
   contextWindow?: string;
   heavy?: boolean;
+  requiresToken?: boolean;
 }
 
 export interface EmbedModelInfo {

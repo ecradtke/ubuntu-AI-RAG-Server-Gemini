@@ -28,22 +28,6 @@ export const CURATED_LLM_MODELS: LLMModelInfo[] = [
     contextWindow: '32k'
   },
   {
-    id: 'OpenVINO/Llama-3.2-3B-Instruct-int4-ov',
-    name: 'Llama 3.2 3B',
-    params: '3B',
-    size: '~2.0 GB',
-    description: 'Meta compact instruction model. Extremely reliable and factual, fast TTFT.',
-    contextWindow: '128k'
-  },
-  {
-    id: 'OpenVINO/gemma-3-4B-it-int4-ov',
-    name: 'Gemma 3 4B',
-    params: '4B',
-    size: '~2.5 GB',
-    description: 'Google multimodal & reasoning model fine-tuned for high precision instruction following.',
-    contextWindow: '32k'
-  },
-  {
     id: 'OpenVINO/Qwen2.5-7B-Instruct-int4-ov',
     name: 'Qwen2.5 7B Instruct ⭐',
     params: '7B',
@@ -61,14 +45,6 @@ export const CURATED_LLM_MODELS: LLMModelInfo[] = [
     contextWindow: '32k'
   },
   {
-    id: 'OpenVINO/Llama-3.1-8B-Instruct-int4-ov',
-    name: 'Llama 3.1 8B Instruct',
-    params: '8B',
-    size: '~4.8 GB',
-    description: 'Comprehensive 8B general reasoning model with full 128k context support.',
-    contextWindow: '128k'
-  },
-  {
     id: 'OpenVINO/Qwen3-8B-int4-ov',
     name: 'Qwen3 8B 🔥',
     params: '8B',
@@ -78,12 +54,40 @@ export const CURATED_LLM_MODELS: LLMModelInfo[] = [
     contextWindow: '32k'
   },
   {
+    id: 'OpenVINO/Llama-3.2-3B-Instruct-int4-ov',
+    name: 'Llama 3.2 3B',
+    params: '3B',
+    size: '~2.0 GB',
+    description: 'Meta compact model. Note: Gated on Hugging Face (requires HF_TOKEN in .env).',
+    requiresToken: true,
+    contextWindow: '128k'
+  },
+  {
+    id: 'OpenVINO/Llama-3.1-8B-Instruct-int4-ov',
+    name: 'Llama 3.1 8B Instruct',
+    params: '8B',
+    size: '~4.8 GB',
+    description: 'Comprehensive 8B general reasoning model. Note: Gated on Hugging Face (requires HF_TOKEN in .env).',
+    requiresToken: true,
+    contextWindow: '128k'
+  },
+  {
+    id: 'OpenVINO/gemma-3-4b-it-int4-ov',
+    name: 'Gemma 3 4B',
+    params: '4B',
+    size: '~2.5 GB',
+    description: 'Google multimodal instruction model. Note: Gated on Hugging Face (requires HF_TOKEN in .env).',
+    requiresToken: true,
+    contextWindow: '32k'
+  },
+  {
     id: 'OpenVINO/gemma-3-12b-it-int4-ov',
     name: 'Gemma 3 12B',
     params: '12B',
     size: '~7.5 GB',
-    description: 'Heavy 12B model. Requires >8 GB GPU memory (may trigger CPU fallback if VRAM overflows).',
+    description: 'Heavy 12B model (>6.8 GB). Exceeds GPU VRAM limit; requires SWITCH_ALLOW_CPU=on to run on CPU.',
     heavy: true,
+    requiresToken: true,
     contextWindow: '32k'
   },
   {
@@ -91,7 +95,7 @@ export const CURATED_LLM_MODELS: LLMModelInfo[] = [
     name: 'Qwen3 14B',
     params: '14B',
     size: '~8.5 GB',
-    description: 'Large parameter model. Requires >9 GB GPU memory; rolls back if memory check fails.',
+    description: 'Large 14B model (>6.8 GB). Exceeds GPU VRAM limit; requires SWITCH_ALLOW_CPU=on to run on CPU.',
     heavy: true,
     contextWindow: '32k'
   }

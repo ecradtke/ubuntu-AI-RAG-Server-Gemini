@@ -274,24 +274,40 @@ export const App: React.FC = () => {
   };
 
   const handleSwitchLlmModel = async (modelId: string) => {
-    setSwitchState({ state: 'loading', model: modelId });
-    const res = await client.switchLlmModel(modelId);
-    if (res.success) {
-      handleUpdateConfig({ currentLlmModel: modelId, llmHardware: 'GPU' });
-      setSwitchState({ state: 'idle', model: modelId });
-    } else {
-      setSwitchState({ state: 'error', error: res.error, model: config.currentLlmModel });
+    setSwitchState({ state: 'loading', model: modelId, stage: 'initiating' });
+    const timer = setInterval(() => {
+      setSwitchState({ ...client.getSwitchStatus() });
+    }, 1500);
+
+    try {
+      const res = await client.switchLlmModel(modelId);
+      if (res.success) {
+        handleUpdateConfig({ currentLlmModel: modelId, llmHardware: client.getConfig().llmHardware });
+        setSwitchState({ state: 'idle', model: modelId });
+      } else {
+        setSwitchState({ state: 'error', error: res.error, model: config.currentLlmModel });
+      }
+    } finally {
+      clearInterval(timer);
     }
   };
 
   const handleSwitchEmbedModel = async (modelId: string) => {
-    setEmbedSwitchState({ state: 'loading', model: modelId });
-    const res = await client.switchEmbedModel(modelId);
-    if (res.success) {
-      handleUpdateConfig({ currentEmbedModel: modelId });
-      setEmbedSwitchState({ state: 'idle', model: modelId });
-    } else {
-      setEmbedSwitchState({ state: 'error', error: res.error, model: config.currentEmbedModel });
+    setEmbedSwitchState({ state: 'loading', model: modelId, stage: 'initiating' });
+    const timer = setInterval(() => {
+      setEmbedSwitchState({ ...client.getEmbedSwitchStatus() });
+    }, 1500);
+
+    try {
+      const res = await client.switchEmbedModel(modelId);
+      if (res.success) {
+        handleUpdateConfig({ currentEmbedModel: modelId, embedHardware: client.getConfig().embedHardware });
+        setEmbedSwitchState({ state: 'idle', model: modelId });
+      } else {
+        setEmbedSwitchState({ state: 'error', error: res.error, model: config.currentEmbedModel });
+      }
+    } finally {
+      clearInterval(timer);
     }
   };
 

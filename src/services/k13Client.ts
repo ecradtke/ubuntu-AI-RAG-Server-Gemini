@@ -18,8 +18,8 @@ import {
 export class K13Client {
   private config: ClusterConfig;
   private services: SystemService[] = [...DEFAULT_SYSTEMD_SERVICES];
-  private switchStatus: { state: 'idle' | 'loading' | 'error'; model?: string; error?: string } = { state: 'idle' };
-  private embedSwitchStatus: { state: 'idle' | 'loading' | 'error'; model?: string; error?: string } = { state: 'idle' };
+  private switchStatus: { state: 'idle' | 'loading' | 'error'; model?: string; error?: string; stage?: string } = { state: 'idle' };
+  private embedSwitchStatus: { state: 'idle' | 'loading' | 'error'; model?: string; error?: string; stage?: string } = { state: 'idle' };
 
   constructor(config: ClusterConfig) {
     this.config = config;
@@ -567,23 +567,54 @@ export class K13Client {
    * Switch LLM model via OpenVINO server API
    */
   public async switchLlmModel(targetModelId: string): Promise<{ success: boolean; error?: string }> {
-    this.switchStatus = { state: 'loading', model: targetModelId };
+    this.switchStatus = { state: 'loading', model: targetModelId, stage: 'initiating' };
     try {
       const res = await this.inferenceFetch('/api/switch-model', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: targetModelId }),
-        signal: AbortSignal.timeout(10000)
+        signal: AbortSignal.timeout(15000)
       });
-      if (res.ok) {
-        this.config.currentLlmModel = targetModelId;
-        this.switchStatus = { state: 'idle', model: targetModelId };
-        return { success: true };
-      } else {
+      if (!res.ok) {
         const errText = await res.text();
         this.switchStatus = { state: 'error', model: this.config.currentLlmModel, error: errText };
         return { success: false, error: errText };
       }
+
+      // Poll switch status until completed, failed, or timed out (up to 4 minutes for downloads)
+      const maxAttempts = 120;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        await new Promise(r => setTimeout(r, 2000));
+        try {
+          const statusRes = await this.inferenceFetch('/api/switch-model/status', {
+            signal: AbortSignal.timeout(5000)
+          });
+          if (statusRes.ok) {
+            const data = await statusRes.json();
+            const s = data.switch_status;
+            if (s.state === 'idle') {
+              this.config.currentLlmModel = data.current_model || targetModelId;
+              if (data.active_device) {
+                this.config.llmHardware = data.active_device === 'CPU' ? 'CPU' : 'GPU';
+              }
+              this.switchStatus = { state: 'idle', model: this.config.currentLlmModel };
+              return { success: true };
+            } else if (s.state === 'error') {
+              const errMsg = s.error || 'Model switch failed';
+              this.switchStatus = { state: 'error', model: this.config.currentLlmModel, error: errMsg };
+              return { success: false, error: errMsg };
+            } else if (s.state === 'loading') {
+              this.switchStatus = { state: 'loading', model: targetModelId, stage: s.stage || 'loading' };
+            }
+          }
+        } catch {
+          // Continue polling while server is compiling or reloading
+        }
+      }
+
+      const timeoutMsg = 'Model switch timed out after 4 minutes. The model may still be downloading in the background.';
+      this.switchStatus = { state: 'error', model: this.config.currentLlmModel, error: timeoutMsg };
+      return { success: false, error: timeoutMsg };
     } catch (e: any) {
       this.switchStatus = { state: 'error', model: this.config.currentLlmModel, error: e.message || String(e) };
       return { success: false, error: e.message || String(e) };
@@ -594,23 +625,54 @@ export class K13Client {
    * Switch Embedding model via OpenVINO server API
    */
   public async switchEmbedModel(targetModelId: string): Promise<{ success: boolean; error?: string }> {
-    this.embedSwitchStatus = { state: 'loading', model: targetModelId };
+    this.embedSwitchStatus = { state: 'loading', model: targetModelId, stage: 'initiating' };
     try {
       const res = await this.inferenceFetch('/api/switch-embed-model', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: targetModelId }),
-        signal: AbortSignal.timeout(10000)
+        signal: AbortSignal.timeout(15000)
       });
-      if (res.ok) {
-        this.config.currentEmbedModel = targetModelId;
-        this.embedSwitchStatus = { state: 'idle', model: targetModelId };
-        return { success: true };
-      } else {
+      if (!res.ok) {
         const errText = await res.text();
         this.embedSwitchStatus = { state: 'error', model: this.config.currentEmbedModel, error: errText };
         return { success: false, error: errText };
       }
+
+      // Poll switch status until completed
+      const maxAttempts = 60;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        await new Promise(r => setTimeout(r, 2000));
+        try {
+          const statusRes = await this.inferenceFetch('/api/switch-embed-model/status', {
+            signal: AbortSignal.timeout(5000)
+          });
+          if (statusRes.ok) {
+            const data = await statusRes.json();
+            const s = data.switch_status;
+            if (s.state === 'idle') {
+              this.config.currentEmbedModel = data.current_model || targetModelId;
+              if (data.active_device) {
+                this.config.embedHardware = data.active_device === 'CPU' ? 'CPU' : 'NPU';
+              }
+              this.embedSwitchStatus = { state: 'idle', model: this.config.currentEmbedModel };
+              return { success: true };
+            } else if (s.state === 'error') {
+              const errMsg = s.error || 'Embedding model switch failed';
+              this.embedSwitchStatus = { state: 'error', model: this.config.currentEmbedModel, error: errMsg };
+              return { success: false, error: errMsg };
+            } else if (s.state === 'loading') {
+              this.embedSwitchStatus = { state: 'loading', model: targetModelId, stage: s.stage || 'loading' };
+            }
+          }
+        } catch {
+          // Continue polling
+        }
+      }
+
+      const timeoutMsg = 'Embedding switch timed out after 2 minutes.';
+      this.embedSwitchStatus = { state: 'error', model: this.config.currentEmbedModel, error: timeoutMsg };
+      return { success: false, error: timeoutMsg };
     } catch (e: any) {
       this.embedSwitchStatus = { state: 'error', model: this.config.currentEmbedModel, error: e.message || String(e) };
       return { success: false, error: e.message || String(e) };

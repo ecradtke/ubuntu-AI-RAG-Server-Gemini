@@ -60,25 +60,74 @@ embed_switch_status: Dict[str, Any] = {"state": "idle", "model": DEFAULT_EMBED_R
 
 
 def load_llm(model_id: str):
-    global llm_pipeline, active_llm_device, current_llm_repo
+    global llm_pipeline, active_llm_device, current_llm_repo, model_switch_status
     with llm_lock:
         logger.info(f"Loading LLM {model_id} on {INFERENCE_DEVICE}...")
+        old_pipe = llm_pipeline
+        old_repo = current_llm_repo
+        old_device = active_llm_device
+        
         try:
             import openvino_genai as ov_genai
-            # Download / locate model path
             from huggingface_hub import snapshot_download
-            model_path = snapshot_download(repo_id=model_id, local_dir=os.path.join(MODELS_DIR, model_id.replace("/", "_")))
-            
+            import gc
+
+            # 1. Download or verify model cache using HF token if available
+            model_switch_status["stage"] = "downloading"
+            hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN") or None
+            local_target = os.path.join(MODELS_DIR, model_id.replace("/", "_"))
+
             try:
-                pipe = ov_genai.LLMPipeline(model_path, INFERENCE_DEVICE)
-                active_llm_device = INFERENCE_DEVICE
+                model_path = snapshot_download(
+                    repo_id=model_id,
+                    local_dir=local_target,
+                    token=hf_token
+                )
+            except Exception as e_dl:
+                err_str = str(e_dl)
+                if "401" in err_str or "403" in err_str or "gated" in err_str.lower():
+                    raise RuntimeError(
+                        f"Gated model access error for '{model_id}'. Hugging Face requires license approval and an access token. "
+                        "Add HF_TOKEN=your_token to .env and restart k13-openvino."
+                    ) from e_dl
+                elif "404" in err_str or "Repository Not Found" in err_str:
+                    raise RuntimeError(f"Hugging Face repository '{model_id}' not found. Please verify the model ID spelling.") from e_dl
+                raise RuntimeError(f"Failed downloading {model_id}: {e_dl}") from e_dl
+
+            # 2. Release previous pipeline memory before compiling new model onto GPU
+            model_switch_status["stage"] = "compiling"
+            llm_pipeline = None
+            del old_pipe
+            gc.collect()
+
+            # 3. Compile onto GPU (or fallback to CPU if allowed)
+            target_device = INFERENCE_DEVICE
+            try:
+                logger.info(f"Compiling LLMPipeline for {model_id} on {target_device}...")
+                pipe = ov_genai.LLMPipeline(model_path, target_device)
+                active_llm_device = target_device
             except Exception as e_gpu:
                 if SWITCH_ALLOW_CPU:
-                    logger.warning(f"Could not load on {INFERENCE_DEVICE} ({e_gpu}), falling back to CPU...")
+                    logger.warning(f"Could not load on {target_device} ({e_gpu}), falling back to CPU...")
                     pipe = ov_genai.LLMPipeline(model_path, "CPU")
                     active_llm_device = "CPU"
                 else:
-                    raise e_gpu
+                    # Roll back to old model if available
+                    logger.error(f"Compilation on {target_device} failed: {e_gpu}. Rolling back to {old_repo}...")
+                    if old_repo and old_repo != model_id:
+                        old_path = os.path.join(MODELS_DIR, old_repo.replace("/", "_"))
+                        if os.path.exists(old_path):
+                            try:
+                                llm_pipeline = ov_genai.LLMPipeline(old_path, old_device)
+                                active_llm_device = old_device
+                                current_llm_repo = old_repo
+                                logger.info(f"[✓] Restored previous model {old_repo} on {old_device}")
+                            except Exception as e_rb:
+                                logger.warning(f"Rollback failed: {e_rb}")
+                    raise RuntimeError(
+                        f"Model {model_id} exceeded GPU VRAM limit (~6.8 GB) or failed on GPU: {e_gpu}. "
+                        "Enable 'SWITCH_ALLOW_CPU=on' in .env or via web portal if you wish to run large models on CPU."
+                    ) from e_gpu
 
             llm_pipeline = pipe
             current_llm_repo = model_id
@@ -89,21 +138,39 @@ def load_llm(model_id: str):
 
 
 def load_embed(model_id: str):
-    global embed_model, embed_tokenizer, active_embed_device, current_embed_repo
+    global embed_model, embed_tokenizer, active_embed_device, current_embed_repo, embed_switch_status
     with embed_lock:
         target_device = EMBED_DEVICE.upper()
         logger.info(f"Loading embedding model {model_id} on {target_device}...")
+        old_model = embed_model
+        old_tok = embed_tokenizer
+
         try:
             import openvino as ov
             from transformers import AutoTokenizer
+            from huggingface_hub import snapshot_download
+            import gc
+
+            embed_switch_status["stage"] = "downloading"
+            hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN") or None
+            local_target = os.path.join(MODELS_DIR, model_id.replace("/", "_"))
+
+            model_path = snapshot_download(
+                repo_id=model_id,
+                local_dir=local_target,
+                token=hf_token
+            )
+
+            embed_switch_status["stage"] = "compiling"
+            embed_model = None
+            del old_model
+            gc.collect()
+
+            tok = AutoTokenizer.from_pretrained(model_path)
             core = ov.Core()
             available = core.available_devices
             logger.info(f"OpenVINO available devices: {available}")
-            
-            from huggingface_hub import snapshot_download
-            model_path = snapshot_download(repo_id=model_id, local_dir=os.path.join(MODELS_DIR, model_id.replace("/", "_")))
-            
-            tok = AutoTokenizer.from_pretrained(model_path)
+
             # Find openvino IR xml or convert
             xml_files = [f for f in os.listdir(model_path) if f.endswith(".xml")]
             if xml_files:
@@ -118,14 +185,12 @@ def load_embed(model_id: str):
                 if "NPU" not in available:
                     logger.warning(
                         f"NPU requested, but 'NPU' is not found in OpenVINO available devices ({available}). "
-                        "Falling back to CPU. (Check Intel NPU driver and /dev/accel/accel0 permissions)."
+                        "Falling back to CPU."
                     )
                 else:
-                    logger.info("Reshaping embedding model to static shape (1, 512) for Intel NPU compilation...")
                     try:
                         shapes = {inp.get_any_name(): [1, 512] for inp in model.inputs}
                         model.reshape(shapes)
-                        logger.info("Model reshaped to static (1, 512). Compiling on NPU...")
                         compiled = core.compile_model(model, "NPU")
                         active_embed_device = "NPU"
                         logger.info(f"[✓] Embeddings {model_id} successfully compiled and active on NPU")
@@ -134,7 +199,6 @@ def load_embed(model_id: str):
                         compiled = None
 
             if compiled is None:
-                # CPU fallback: reset to dynamic shapes if reshaped
                 try:
                     dyn_shapes = {inp.get_any_name(): [-1, -1] for inp in model.inputs}
                     model.reshape(dyn_shapes)
@@ -149,6 +213,7 @@ def load_embed(model_id: str):
             current_embed_repo = model_id
         except Exception as e:
             logger.error(f"Failed to load embed model {model_id}: {e}", exc_info=True)
+            raise e
 
 
 app = FastAPI(title="K13 OpenVINO Server")
@@ -207,12 +272,12 @@ def switch_model(req: SwitchModelReq):
 
     def run_switch():
         global model_switch_status
-        model_switch_status = {"state": "loading", "model": req.model, "error": None}
+        model_switch_status = {"state": "loading", "stage": "downloading", "model": req.model, "error": None}
         try:
             load_llm(req.model)
-            model_switch_status = {"state": "idle", "model": req.model, "error": None}
+            model_switch_status = {"state": "idle", "stage": "ready", "model": req.model, "error": None}
         except Exception as e:
-            model_switch_status = {"state": "error", "model": current_llm_repo, "error": str(e)}
+            model_switch_status = {"state": "error", "stage": "failed", "model": current_llm_repo, "error": str(e)}
 
     threading.Thread(target=run_switch, daemon=True).start()
     return {"status": "started", "target": req.model}
@@ -220,7 +285,11 @@ def switch_model(req: SwitchModelReq):
 
 @app.get("/api/switch-model/status")
 def switch_model_status():
-    return {"current_model": current_llm_repo, "switch_status": model_switch_status}
+    return {
+        "current_model": current_llm_repo,
+        "active_device": active_llm_device,
+        "switch_status": model_switch_status
+    }
 
 
 @app.post("/api/switch-embed-model")
@@ -231,12 +300,12 @@ def switch_embed_model(req: SwitchModelReq):
 
     def run_embed_switch():
         global embed_switch_status
-        embed_switch_status = {"state": "loading", "model": req.model, "error": None}
+        embed_switch_status = {"state": "loading", "stage": "downloading", "model": req.model, "error": None}
         try:
             load_embed(req.model)
-            embed_switch_status = {"state": "idle", "model": req.model, "error": None}
+            embed_switch_status = {"state": "idle", "stage": "ready", "model": req.model, "error": None}
         except Exception as e:
-            embed_switch_status = {"state": "error", "model": current_embed_repo, "error": str(e)}
+            embed_switch_status = {"state": "error", "stage": "failed", "model": current_embed_repo, "error": str(e)}
 
     threading.Thread(target=run_embed_switch, daemon=True).start()
     return {"status": "started", "target": req.model}
@@ -244,7 +313,11 @@ def switch_embed_model(req: SwitchModelReq):
 
 @app.get("/api/switch-embed-model/status")
 def switch_embed_model_status():
-    return {"current_model": current_embed_repo, "switch_status": embed_switch_status}
+    return {
+        "current_model": current_embed_repo,
+        "active_device": active_embed_device,
+        "switch_status": embed_switch_status
+    }
 
 
 @app.post("/api/reload")
