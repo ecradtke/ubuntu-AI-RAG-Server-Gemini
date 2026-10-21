@@ -176,7 +176,12 @@ def healthz():
         "llm_hardware": active_llm_device,
         "embed_hardware": active_embed_device,
         "current_model": current_llm_repo,
-        "current_embed_model": current_embed_repo
+        "current_embed_model": current_embed_repo,
+        "max_new_tokens": MAX_NEW_TOKENS,
+        "switch_allow_cpu": SWITCH_ALLOW_CPU,
+        "llm_thinking": LLM_THINKING,
+        "server_host": SERVER_HOST,
+        "server_port": SERVER_PORT,
     }
 
 

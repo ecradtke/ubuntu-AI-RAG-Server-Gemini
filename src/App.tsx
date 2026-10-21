@@ -12,7 +12,9 @@ import { K13Client } from './services/k13Client';
 
 const defaultHost = typeof window !== 'undefined' && window.location.hostname ? window.location.hostname : '127.0.0.1';
 
-const envBudget = Number((import.meta as any).env?.RAG_CONTEXT_TOKEN_BUDGET || (import.meta as any).env?.VITE_RAG_CONTEXT_TOKEN_BUDGET) || 8000;
+const envBudget = Number((import.meta as any).env?.RAG_CONTEXT_TOKEN_BUDGET || (import.meta as any).env?.VITE_RAG_CONTEXT_TOKEN_BUDGET) || 20000;
+const envTopKMax = Number((import.meta as any).env?.TOP_K_MAX || (import.meta as any).env?.VITE_TOP_K_MAX) || 150;
+const envMaxNewTokens = Number((import.meta as any).env?.MAX_NEW_TOKENS || (import.meta as any).env?.VITE_MAX_NEW_TOKENS) || 2048;
 
 const INITIAL_CONFIG: ClusterConfig = {
   connectionMode: 'live',
@@ -20,11 +22,13 @@ const INITIAL_CONFIG: ClusterConfig = {
   qdrantUrl: `http://${defaultHost}:6333`,
   activeCollection: 'rss_articles',
   activeDbEngine: 'Qdrant (Local)',
-  currentLlmModel: 'OpenVINO/Phi-3.5-mini-instruct-int4-ov',
-  currentEmbedModel: 'BAAI/bge-base-en-v1.5',
+  currentLlmModel: (import.meta as any).env?.DEFAULT_MODEL || 'OpenVINO/Phi-3.5-mini-instruct-int4-ov',
+  currentEmbedModel: (import.meta as any).env?.EMBED_MODEL || 'BAAI/bge-base-en-v1.5',
   llmHardware: 'GPU',
   embedHardware: 'NPU',
   topK: 6,
+  topKMax: envTopKMax,
+  maxNewTokens: envMaxNewTokens,
   ragContextTokenBudget: envBudget,
   persona: 'Objective News Analyst',
   feedFilter: '(All Feeds)',
@@ -93,8 +97,70 @@ export const App: React.FC = () => {
     localStorage.setItem('k13_chat_history', JSON.stringify(messages));
   }, [messages]);
 
+  // Fetch live .env values from Vite server middleware
+  const fetchLiveEnv = useCallback(async () => {
+    try {
+      const res = await fetch('/api/env');
+      if (res.ok) {
+        const data = await res.json();
+        if (data && data.env) {
+          setConfig(prev => {
+            const updates: Partial<ClusterConfig> = {
+              liveEnv: data.env,
+              envSource: data.source || '.env'
+            };
+
+            if (data.env.RAG_CONTEXT_TOKEN_BUDGET) {
+              const b = parseInt(data.env.RAG_CONTEXT_TOKEN_BUDGET, 10);
+              if (!isNaN(b) && b > 0) {
+                updates.ragContextTokenBudget = b;
+              }
+            }
+
+            if (data.env.TOP_K_MAX) {
+              const k = parseInt(data.env.TOP_K_MAX, 10);
+              if (!isNaN(k) && k > 0) {
+                updates.topKMax = k;
+              }
+            }
+
+            if (data.env.MAX_NEW_TOKENS) {
+              const m = parseInt(data.env.MAX_NEW_TOKENS, 10);
+              if (!isNaN(m) && m > 0) {
+                updates.maxNewTokens = m;
+              }
+            }
+
+            if (data.env.DEFAULT_MODEL) {
+              updates.currentLlmModel = data.env.DEFAULT_MODEL;
+            }
+
+            if (data.env.EMBED_MODEL) {
+              updates.currentEmbedModel = data.env.EMBED_MODEL;
+            }
+
+            if (data.env.SWITCH_ALLOW_CPU !== undefined) {
+              updates.switchAllowCpu = data.env.SWITCH_ALLOW_CPU.toLowerCase() === 'on';
+            }
+
+            if (data.env.LLM_THINKING !== undefined) {
+              updates.llmThinking = data.env.LLM_THINKING.toLowerCase() === 'on';
+            }
+
+            return { ...prev, ...updates };
+          });
+        }
+      }
+    } catch {
+      // Ignore if offline
+    }
+  }, []);
+
   // Query real Qdrant count & facets + OpenVINO health
   const refreshClusterData = useCallback(async () => {
+    // 0. Fetch live environment variables from .env
+    await fetchLiveEnv();
+
     // 1. Fetch real Qdrant status & point count
     const status = await client.fetchCollectionStatus();
     setDbState(status);
@@ -122,7 +188,7 @@ export const App: React.FC = () => {
         currentLlmModel: health.currentModel || prev.currentLlmModel
       }));
     }
-  }, [client]);
+  }, [client, fetchLiveEnv]);
 
   useEffect(() => {
     refreshClusterData();

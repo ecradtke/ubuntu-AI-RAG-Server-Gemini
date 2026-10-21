@@ -119,6 +119,8 @@ export interface ClusterConfig {
   llmHardware: 'GPU' | 'CPU';
   embedHardware: 'NPU' | 'CPU';
   topK: number;
+  topKMax?: number;
+  maxNewTokens?: number;
   ragContextTokenBudget: number;
   persona: PersonaType;
   feedFilter: string;
@@ -132,4 +134,6 @@ export interface ClusterConfig {
   searchKeywords: string;
   llmThinking: boolean;
   switchAllowCpu: boolean;
+  liveEnv?: Record<string, string>;
+  envSource?: string;
 }

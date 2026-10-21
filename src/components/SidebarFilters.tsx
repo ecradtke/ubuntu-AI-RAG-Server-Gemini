@@ -142,7 +142,7 @@ export const SidebarFilters: React.FC<SidebarFiltersProps> = ({
           <input
             type="range"
             min={1}
-            max={100}
+            max={config.topKMax || 150}
             step={1}
             value={config.topK}
             onChange={e => onUpdateConfig({ topK: parseInt(e.target.value) || 1 })}
@@ -156,7 +156,7 @@ export const SidebarFilters: React.FC<SidebarFiltersProps> = ({
               </span>
             ) : (
               <span>
-                ≈{estTokens.toLocaleString()} tokens of context (budget: {config.ragContextTokenBudget.toLocaleString()}).
+                ≈{estTokens.toLocaleString()} tokens of context (budget: {config.ragContextTokenBudget.toLocaleString()}, max Top K: {config.topKMax || 150}).
               </span>
             )}
           </div>
@@ -173,10 +173,10 @@ export const SidebarFilters: React.FC<SidebarFiltersProps> = ({
           <input
             type="range"
             min={2000}
-            max={32000}
+            max={Math.max(32000, config.ragContextTokenBudget)}
             step={1000}
             value={config.ragContextTokenBudget}
-            onChange={e => onUpdateConfig({ ragContextTokenBudget: parseInt(e.target.value) || 8000 })}
+            onChange={e => onUpdateConfig({ ragContextTokenBudget: parseInt(e.target.value) || 20000 })}
             className="w-full accent-sky-500 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
           />
           {/* Quick presets */}
