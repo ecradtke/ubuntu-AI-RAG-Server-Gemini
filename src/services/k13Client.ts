@@ -680,41 +680,130 @@ export class K13Client {
   }
 
   /**
-   * Control systemd services
+   * Fetch live systemd services status from server API
    */
-  public async controlService(serviceId: string, action: 'start' | 'stop' | 'restart'): Promise<void> {
+  public async fetchServices(): Promise<SystemService[]> {
+    try {
+      const res = await fetch('/api/services', { signal: AbortSignal.timeout(4000) });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.services) && data.services.length > 0) {
+          this.services = data.services;
+          return this.services;
+        }
+      }
+    } catch {
+      // Fallback to current state if API offline
+    }
+    return this.services;
+  }
+
+  /**
+   * Control systemd services (start, stop, restart) via server API
+   */
+  public async controlService(serviceId: string, action: 'start' | 'stop' | 'restart'): Promise<{ success: boolean; error?: string }> {
+    // Immediately mark as restarting/transitioning in UI
     const idx = this.services.findIndex(s => s.id === serviceId);
     if (idx !== -1) {
-      if (action === 'restart') {
-        this.services[idx].status = 'restarting';
-        await new Promise(r => setTimeout(r, 600));
-        this.services[idx].status = 'active';
-        this.services[idx].uptime = 'Just now';
-      } else if (action === 'stop') {
-        this.services[idx].status = 'inactive';
-      } else if (action === 'start') {
-        this.services[idx].status = 'active';
-        this.services[idx].uptime = 'Just now';
+      if (action === 'restart') this.services[idx].status = 'restarting';
+      else if (action === 'stop') this.services[idx].status = 'inactive';
+      else if (action === 'start') this.services[idx].status = 'active';
+    }
+
+    try {
+      const res = await fetch('/api/services/control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ service: serviceId, action }),
+        signal: AbortSignal.timeout(15000)
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.serviceStatus && idx !== -1) {
+          this.services[idx] = data.serviceStatus;
+        } else {
+          await this.fetchServices();
+        }
+        return { success: true };
+      } else {
+        const errText = await res.text();
+        return { success: false, error: errText };
       }
+    } catch (e: any) {
+      return { success: false, error: e?.message || String(e) };
     }
   }
 
   /**
-   * Smoke test embedding + chat
+   * Fetch real journalctl logs for a service
+   */
+  public async fetchServiceLogs(serviceId: string): Promise<string[]> {
+    try {
+      const res = await fetch(`/api/services/logs?service=${encodeURIComponent(serviceId)}`, {
+        signal: AbortSignal.timeout(5000)
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.logs)) {
+          return data.logs;
+        }
+      }
+    } catch {
+      // Fallback
+    }
+    return [`[${new Date().toLocaleTimeString()}] Live journal logs unavailable from /api/services/logs.`];
+  }
+
+  /**
+   * Run live smoke test on OpenVINO hardware endpoints
    */
   public async runSmokeTest(): Promise<{
     embedSuccess: boolean;
     embedDims: number;
     chatSuccess: boolean;
     chatResponse: string;
+    durationSeconds?: number;
   }> {
+    // 1. Try server smoke test API
+    try {
+      const res = await fetch('/api/services/smoke-test', {
+        method: 'POST',
+        signal: AbortSignal.timeout(20000)
+      });
+      if (res.ok) {
+        const data = await res.json();
+        return data;
+      }
+    } catch {}
+
+    // 2. Direct client-side test fallback
+    const t0 = performance.now();
     const testVec = await this.generateEmbedding('High-NA EUV lithography');
     const dims = testVec ? testVec.length : (this.config.currentEmbedModel.includes('small') ? 384 : 768);
+
+    let chatSuccess = false;
+    let chatResponse = 'timeout or unreachable';
+    try {
+      const chatRes = await this.inferenceFetch('/api/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: 'Reply with the single word: ready', stream: false }),
+        signal: AbortSignal.timeout(15000)
+      });
+      if (chatRes.ok) {
+        const chatData = await chatRes.json();
+        chatResponse = (chatData.response || '').trim() || 'ready';
+        chatSuccess = true;
+      }
+    } catch {}
+
+    const totalSeconds = Number(((performance.now() - t0) / 1000).toFixed(2));
     return {
       embedSuccess: Boolean(testVec),
       embedDims: dims,
-      chatSuccess: true,
-      chatResponse: 'ready (OpenVINO server on 127.0.0.1:11434)'
+      chatSuccess,
+      chatResponse,
+      durationSeconds: totalSeconds
     };
   }
 }

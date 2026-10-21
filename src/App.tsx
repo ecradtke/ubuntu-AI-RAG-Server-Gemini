@@ -200,6 +200,28 @@ export const App: React.FC = () => {
   const [switchState, setSwitchState] = useState(client.getSwitchStatus());
   const [embedSwitchState, setEmbedSwitchState] = useState(client.getEmbedSwitchStatus());
 
+  // Poll and refresh live services status
+  const refreshServices = useCallback(async () => {
+    try {
+      const live = await client.fetchServices();
+      if (live && live.length > 0) {
+        setServices([...live]);
+      }
+    } catch {}
+  }, [client]);
+
+  useEffect(() => {
+    refreshServices();
+  }, [refreshServices]);
+
+  useEffect(() => {
+    if (activeTab === 'services') {
+      refreshServices();
+      const interval = setInterval(refreshServices, 6000);
+      return () => clearInterval(interval);
+    }
+  }, [activeTab, refreshServices]);
+
   const handleUpdateConfig = (newConfig: Partial<ClusterConfig>) => {
     setConfig(prev => ({ ...prev, ...newConfig }));
   };
@@ -312,9 +334,17 @@ export const App: React.FC = () => {
   };
 
   const handleControlService = async (id: string, action: 'start' | 'stop' | 'restart') => {
-    await client.controlService(id, action);
-    setServices([...client.getServices()]);
+    const res = await client.controlService(id, action);
+    const updated = await client.fetchServices();
+    if (updated && updated.length > 0) {
+      setServices([...updated]);
+    }
+    return res;
   };
+
+  const handleFetchLogs = useCallback(async (id: string) => {
+    return await client.fetchServiceLogs(id);
+  }, [client]);
 
   const handleRunSmokeTest = async () => {
     return await client.runSmokeTest();
@@ -383,6 +413,7 @@ export const App: React.FC = () => {
             services={services}
             onControlService={handleControlService}
             onRunSmokeTest={handleRunSmokeTest}
+            onFetchLogs={handleFetchLogs}
           />
         )}
 

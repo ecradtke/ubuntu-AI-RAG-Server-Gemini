@@ -68,8 +68,13 @@ install_units() {
     if [[ -f "/etc/systemd/system/$old" ]]; then sudo systemctl disable --now "$old" 2>/dev/null || true; sudo rm -f "/etc/systemd/system/$old"; fi
   done
   sudo rm -f /etc/sudoers.d/k13-llm-switch /usr/local/sbin/k13-llm-switch
+  # Allow user to control k13 systemd units and query journal logs non-interactively
+  sudo tee /etc/sudoers.d/k13-services >/dev/null <<SUDOERS
+${USER_NAME} ALL=(ALL) NOPASSWD: /bin/systemctl start k13-*, /bin/systemctl stop k13-*, /bin/systemctl restart k13-*, /bin/systemctl status k13-*, /bin/systemctl is-active k13-*, /bin/systemctl show k13-*, /bin/journalctl -u k13-*, /usr/bin/systemctl start k13-*, /usr/bin/systemctl stop k13-*, /usr/bin/systemctl restart k13-*, /usr/bin/systemctl status k13-*, /usr/bin/systemctl is-active k13-*, /usr/bin/systemctl show k13-*, /usr/bin/journalctl -u k13-*
+SUDOERS
+  sudo chmod 0440 /etc/sudoers.d/k13-services
   sudo systemctl daemon-reload
-  ok "Units installed."
+  ok "Units and sudoers permissions installed."
 }
 
 if $UNITS_ONLY; then install_units; exit 0; fi

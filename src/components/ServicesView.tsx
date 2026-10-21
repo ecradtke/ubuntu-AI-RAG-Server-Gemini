@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   Server,
   Play,
@@ -9,27 +9,39 @@ import {
   CheckCircle,
   AlertCircle,
   Clock,
-  HardDrive
+  HardDrive,
+  RefreshCw,
+  Cpu,
+  Layers
 } from 'lucide-react';
 import { SystemService } from '../types';
 
 interface ServicesViewProps {
   services: SystemService[];
-  onControlService: (id: string, action: 'start' | 'stop' | 'restart') => Promise<void>;
+  onControlService: (id: string, action: 'start' | 'stop' | 'restart') => Promise<any>;
   onRunSmokeTest: () => Promise<{
     embedSuccess: boolean;
     embedDims: number;
     chatSuccess: boolean;
     chatResponse: string;
+    durationSeconds?: number;
   }>;
+  onFetchLogs?: (id: string) => Promise<string[]>;
 }
 
 export const ServicesView: React.FC<ServicesViewProps> = ({
   services,
   onControlService,
-  onRunSmokeTest
+  onRunSmokeTest,
+  onFetchLogs
 }) => {
   const [selectedLogService, setSelectedLogService] = useState<string>('openvino');
+  const [liveLogs, setLiveLogs] = useState<string[]>([]);
+  const [logsLoading, setLogsLoading] = useState<boolean>(false);
+  const [autoRefreshLogs, setAutoRefreshLogs] = useState<boolean>(true);
+  const [actionInProgress, setActionInProgress] = useState<Record<string, boolean>>({});
+  const [feedbackBanner, setFeedbackBanner] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
   const [testOutput, setTestOutput] = useState<{
     running: boolean;
     result?: {
@@ -37,59 +49,75 @@ export const ServicesView: React.FC<ServicesViewProps> = ({
       embedDims: number;
       chatSuccess: boolean;
       chatResponse: string;
+      durationSeconds?: number;
     };
   }>({ running: false });
 
-  const handleTest = async () => {
-    setTestOutput({ running: true });
-    const res = await onRunSmokeTest();
-    setTestOutput({ running: false, result: res });
+  // Fetch real journalctl logs for selected service
+  const loadLogs = useCallback(async (svcId: string) => {
+    if (!onFetchLogs) return;
+    setLogsLoading(true);
+    try {
+      const logs = await onFetchLogs(svcId);
+      if (logs && logs.length > 0) {
+        setLiveLogs(logs);
+      }
+    } catch {
+      // Keep previous logs if error
+    } finally {
+      setLogsLoading(false);
+    }
+  }, [onFetchLogs]);
+
+  useEffect(() => {
+    loadLogs(selectedLogService);
+  }, [selectedLogService, loadLogs]);
+
+  // Periodic auto-refresh of logs every 4 seconds if enabled
+  useEffect(() => {
+    if (!autoRefreshLogs) return;
+    const interval = setInterval(() => {
+      loadLogs(selectedLogService);
+    }, 4000);
+    return () => clearInterval(interval);
+  }, [autoRefreshLogs, selectedLogService, loadLogs]);
+
+  const handleControl = async (id: string, action: 'start' | 'stop' | 'restart') => {
+    setActionInProgress(prev => ({ ...prev, [id]: true }));
+    setFeedbackBanner(null);
+
+    try {
+      const res = await onControlService(id, action);
+      if (res && res.error) {
+        setFeedbackBanner({
+          type: 'error',
+          message: `Failed to ${action} ${id}: ${res.error}`
+        });
+      } else {
+        setFeedbackBanner({
+          type: 'success',
+          message: `Signal sent: ${action.toUpperCase()} command issued for ${id}`
+        });
+        // Immediately reload logs to show the restart output
+        setTimeout(() => loadLogs(id), 1000);
+      }
+    } catch (err: any) {
+      setFeedbackBanner({
+        type: 'error',
+        message: `Error executing ${action} on ${id}: ${err.message || String(err)}`
+      });
+    } finally {
+      setActionInProgress(prev => ({ ...prev, [id]: false }));
+    }
   };
 
-  const getLogs = (svcId: string): string[] => {
-    const timestamp = new Date().toLocaleTimeString();
-    switch (svcId) {
-      case 'openvino':
-        return [
-          `systemd[1]: Started k13-openvino.service - OpenVINO Inference Server.`,
-          `openvino-server: INFO - OpenVINO detected available devices: ['CPU', 'GPU.0', 'NPU']`,
-          `openvino-server: INFO - [✓] Intel GPU.0 selected for LLM inference.`,
-          `openvino-server: INFO - [✓] Intel NPU selected for embedding generation.`,
-          `openvino-server: INFO - Loading LLM pipeline from /opt/k13/models/OpenVINO-Phi-3.5-mini-instruct-int4-ov`,
-          `openvino-server: INFO - LLM pipeline compiled successfully on Intel GPU (INT4, 2.2GB VRAM).`,
-          `openvino-server: INFO - Embedding model BAAI/bge-base-en-v1.5 compiled with static shape (1, 512) on Intel NPU.`,
-          `openvino-server: INFO - Uvicorn running on http://127.0.0.1:11434 (Press CTRL+C to quit)`
-        ];
-      case 'qdrant':
-        return [
-          `systemd[1]: Started k13-qdrant.service - Qdrant Vector Database.`,
-          `qdrant: INFO - Storage path: /opt/k13/data/qdrant`,
-          `qdrant: INFO - REST API listening on 127.0.0.1:6333, gRPC on :6334`,
-          `qdrant: INFO - Loaded collection 'rss_articles' (dim: 768, distance: Cosine)`,
-          `qdrant: INFO - Loaded collection 'audio_transcripts' (dim: 768, distance: Cosine)`,
-          `qdrant: INFO - Indexed points count: 14,820 points`
-        ];
-      case 'web':
-        return [
-          `systemd[1]: Started k13-web.service - K13 AI Hub Web Portal.`,
-          `k13-web: Vite dev server running on port 3000 (host: 0.0.0.0)`,
-          `k13-web: Proxying vector search to http://127.0.0.1:6333`,
-          `k13-web: Telemetry connected to http://127.0.0.1:11434/healthz`
-        ];
-      case 'rss':
-        return [
-          `systemd[1]: Triggered k13-rss-sync.timer (every 5 minutes).`,
-          `k13-rss-sync: Authenticated to FreshRSS API at http://nas.local:8080/api/greader.php`,
-          `k13-rss-sync: Queried unread stream (xt=user/-/state/com.google/read): retrieved 24 unread items.`,
-          `k13-rss-sync: [✓] Exported 24 unread items to PostgreSQL 'fetch42.articles'.`,
-          `k13-rss-sync: Generating 768-dim embeddings via Intel NPU (:11434/api/embed)...`,
-          `k13-rss-sync: Upserted 24 vector points to Qdrant collection 'rss_articles'.`,
-          `k13-rss-sync: Updated PostgreSQL vector_indexed = TRUE.`,
-          `k13-rss-sync: [✓] Called FreshRSS edit-tag (a=user/-/state/com.google/read) -> Marked 24 articles as READ in FreshRSS server.`,
-          `systemd[1]: k13-rss-sync.service: Deactivated successfully.`
-        ];
-      default:
-        return [`Log stream initialized.`];
+  const handleTest = async () => {
+    setTestOutput({ running: true });
+    try {
+      const res = await onRunSmokeTest();
+      setTestOutput({ running: false, result: res });
+    } catch {
+      setTestOutput({ running: false });
     }
   };
 
@@ -112,22 +140,48 @@ export const ServicesView: React.FC<ServicesViewProps> = ({
           disabled={testOutput.running}
           className="flex items-center gap-2 px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs shadow-lg shadow-indigo-600/30 transition disabled:opacity-50"
         >
-          <Terminal className="w-4 h-4" />
-          <span>{testOutput.running ? 'Running Tests…' : 'Run Smoke Test (k13ctl test)'}</span>
+          {testOutput.running ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Terminal className="w-4 h-4" />}
+          <span>{testOutput.running ? 'Running Tests…' : 'Run Live Smoke Test (k13ctl test)'}</span>
         </button>
       </div>
+
+      {/* Action Feedback Banner */}
+      {feedbackBanner && (
+        <div className={`p-3 rounded-xl border flex items-center justify-between text-xs font-semibold ${
+          feedbackBanner.type === 'success'
+            ? 'bg-emerald-950/60 border-emerald-700/60 text-emerald-200'
+            : 'bg-red-950/60 border-red-700/60 text-red-200'
+        }`}>
+          <div className="flex items-center gap-2">
+            {feedbackBanner.type === 'success' ? <CheckCircle className="w-4 h-4 text-emerald-400" /> : <AlertCircle className="w-4 h-4 text-red-400" />}
+            <span>{feedbackBanner.message}</span>
+          </div>
+          <button onClick={() => setFeedbackBanner(null)} className="text-slate-400 hover:text-slate-200 px-2 py-0.5">✕</button>
+        </div>
+      )}
 
       {/* Smoke Test Banner */}
       {testOutput.result && (
         <div className="p-4 rounded-xl bg-slate-900 border border-indigo-500/50 space-y-2 font-mono text-xs shadow-xl">
-          <div className="text-xs font-bold text-slate-300 font-sans flex items-center gap-2">
-            <CheckCircle className="w-4 h-4 text-emerald-400" />
-            <span>Smoke Test Completed Successfully (k13ctl.sh test)</span>
+          <div className="text-xs font-bold text-slate-300 font-sans flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <CheckCircle className="w-4 h-4 text-emerald-400" />
+              <span>Live Smoke Test Completed (k13ctl.sh test)</span>
+            </div>
+            {testOutput.result.durationSeconds !== undefined && (
+              <span className="text-slate-400 text-[11px] font-mono">
+                Duration: {testOutput.result.durationSeconds}s
+              </span>
+            )}
           </div>
           <div className="p-3 bg-slate-950 rounded-lg border border-slate-800 text-slate-300 space-y-1">
-            <p className="text-emerald-400 font-semibold">[✓] Embedding test: HTTP 200 OK</p>
-            <p className="text-slate-400 pl-4">• Vector dimensions: {testOutput.result.embedDims} (NPU accelerated)</p>
-            <p className="text-emerald-400 font-semibold mt-1">[✓] Chat test: HTTP 200 OK</p>
+            <p className={testOutput.result.embedSuccess ? "text-emerald-400 font-semibold" : "text-amber-400 font-semibold"}>
+              [{testOutput.result.embedSuccess ? '✓' : '!'}] Embedding test: {testOutput.result.embedSuccess ? '200 OK' : 'Pending / Offline'}
+            </p>
+            <p className="text-slate-400 pl-4">• Vector dimensions: {testOutput.result.embedDims} (Intel NPU accelerated)</p>
+            <p className={testOutput.result.chatSuccess ? "text-emerald-400 font-semibold mt-1" : "text-amber-400 font-semibold mt-1"}>
+              [{testOutput.result.chatSuccess ? '✓' : '!'}] Chat LLM test: {testOutput.result.chatSuccess ? '200 OK' : 'Pending / Offline'}
+            </p>
             <p className="text-slate-400 pl-4">• Response: "{testOutput.result.chatResponse}"</p>
           </div>
         </div>
@@ -137,7 +191,7 @@ export const ServicesView: React.FC<ServicesViewProps> = ({
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {services.map(svc => {
           const isActive = svc.status === 'active';
-          const isRestarting = svc.status === 'restarting';
+          const isRestarting = svc.status === 'restarting' || actionInProgress[svc.id];
 
           return (
             <div
@@ -161,7 +215,7 @@ export const ServicesView: React.FC<ServicesViewProps> = ({
                       isActive
                         ? 'bg-emerald-950/80 text-emerald-300 border-emerald-800/60'
                         : isRestarting
-                        ? 'bg-amber-950/80 text-amber-300 border-amber-800/60'
+                        ? 'bg-amber-950/80 text-amber-300 border-amber-800/60 animate-pulse'
                         : 'bg-red-950/80 text-red-300 border-red-800/60'
                     }`}
                   >
@@ -174,7 +228,7 @@ export const ServicesView: React.FC<ServicesViewProps> = ({
                           : 'bg-red-400'
                       }`}
                     />
-                    <span>{svc.status}</span>
+                    <span>{isRestarting ? 'restarting…' : svc.status}</span>
                   </span>
                 </div>
 
@@ -192,7 +246,7 @@ export const ServicesView: React.FC<ServicesViewProps> = ({
                     <span className="text-slate-200">{svc.memory}</span>
                   </div>
                   <div>
-                    <span className="text-slate-500 block text-[10px] uppercase font-sans">Target</span>
+                    <span className="text-slate-500 block text-[10px] uppercase font-sans">Target Hardware</span>
                     <span className="text-slate-200">{svc.hardware.split(' ')[0]}</span>
                   </div>
                 </div>
@@ -202,39 +256,45 @@ export const ServicesView: React.FC<ServicesViewProps> = ({
               <div className="flex items-center justify-between pt-3 border-t border-slate-800">
                 <button
                   onClick={() => setSelectedLogService(svc.id)}
-                  className={`text-xs px-2.5 py-1 rounded-lg border transition ${
+                  className={`text-xs px-2.5 py-1 rounded-lg border transition flex items-center gap-1.5 ${
                     selectedLogService === svc.id
-                      ? 'bg-sky-950 text-sky-300 border-sky-700 font-semibold'
+                      ? 'bg-sky-950 text-sky-300 border-sky-700 font-semibold shadow-sm'
                       : 'bg-slate-950 text-slate-400 border-slate-800 hover:text-slate-200'
                   }`}
                 >
-                  View Logs
+                  <Terminal className="w-3 h-3" />
+                  <span>View Logs</span>
                 </button>
 
                 <div className="flex items-center gap-1.5">
                   <button
-                    onClick={() => onControlService(svc.id, 'restart')}
+                    onClick={() => handleControl(svc.id, 'restart')}
                     disabled={isRestarting}
                     title="Restart service (k13ctl restart)"
-                    className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition"
+                    className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-300 hover:text-white transition flex items-center gap-1 text-xs"
                   >
-                    <RotateCw className="w-3.5 h-3.5" />
+                    <RotateCw className={`w-3.5 h-3.5 ${isRestarting ? 'animate-spin text-sky-400' : ''}`} />
+                    <span className="text-[11px] font-sans">Restart</span>
                   </button>
                   {isActive ? (
                     <button
-                      onClick={() => onControlService(svc.id, 'stop')}
+                      onClick={() => handleControl(svc.id, 'stop')}
+                      disabled={isRestarting}
                       title="Stop service (k13ctl stop)"
-                      className="p-1.5 rounded-lg bg-slate-800 hover:bg-red-900/60 text-slate-300 hover:text-red-300 transition"
+                      className="p-1.5 rounded-lg bg-slate-800 hover:bg-red-900/60 disabled:opacity-50 text-slate-300 hover:text-red-300 transition flex items-center gap-1 text-xs"
                     >
                       <Square className="w-3.5 h-3.5" />
+                      <span className="text-[11px] font-sans">Stop</span>
                     </button>
                   ) : (
                     <button
-                      onClick={() => onControlService(svc.id, 'start')}
+                      onClick={() => handleControl(svc.id, 'start')}
+                      disabled={isRestarting}
                       title="Start service (k13ctl start)"
-                      className="p-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white transition"
+                      className="p-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 text-white transition flex items-center gap-1 text-xs"
                     >
                       <Play className="w-3.5 h-3.5" />
+                      <span className="text-[11px] font-sans">Start</span>
                     </button>
                   )}
                 </div>
@@ -250,25 +310,58 @@ export const ServicesView: React.FC<ServicesViewProps> = ({
           <div className="flex items-center gap-2">
             <Terminal className="w-4 h-4 text-emerald-400" />
             <span className="font-mono text-xs text-slate-300">
-              journalctl -fu {services.find(s => s.id === selectedLogService)?.unit} -n 100
+              journalctl -fu {services.find(s => s.id === selectedLogService)?.unit || 'k13-openvino.service'} -n 100
             </span>
+            {logsLoading && <RefreshCw className="w-3 h-3 animate-spin text-sky-400 ml-2" />}
           </div>
-          <div className="flex items-center gap-1.5">
-            <span className="w-2.5 h-2.5 rounded-full bg-slate-700" />
-            <span className="w-2.5 h-2.5 rounded-full bg-slate-700" />
-            <span className="w-2.5 h-2.5 rounded-full bg-slate-700" />
+
+          <div className="flex items-center gap-3">
+            <label className="flex items-center gap-1.5 cursor-pointer text-[11px] text-slate-400 select-none">
+              <input
+                type="checkbox"
+                checked={autoRefreshLogs}
+                onChange={e => setAutoRefreshLogs(e.target.checked)}
+                className="rounded border-slate-700 bg-slate-900 text-indigo-500 focus:ring-0 w-3 h-3"
+              />
+              <span>Live stream</span>
+            </label>
+
+            <button
+              onClick={() => loadLogs(selectedLogService)}
+              disabled={logsLoading}
+              title="Refresh logs"
+              className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition"
+            >
+              <RefreshCw className={`w-3 h-3 ${logsLoading ? 'animate-spin' : ''}`} />
+            </button>
           </div>
         </div>
 
-        <div className="p-4 font-mono text-xs text-slate-300 space-y-1 overflow-x-auto max-h-72">
-          {getLogs(selectedLogService).map((line, i) => (
-            <div key={i} className="leading-relaxed hover:bg-slate-900/40 px-1 rounded">
-              <span className="text-slate-500 mr-2">{i + 1}</span>
-              <span className={line.includes('INFO') ? 'text-sky-300' : line.includes('Started') ? 'text-emerald-400' : 'text-slate-300'}>
-                {line}
-              </span>
+        <div className="p-4 font-mono text-xs text-slate-300 space-y-1 overflow-x-auto max-h-80 min-h-48 font-light">
+          {liveLogs.length > 0 ? (
+            liveLogs.map((line, i) => (
+              <div key={i} className="leading-relaxed hover:bg-slate-900/60 px-1 rounded flex">
+                <span className="text-slate-600 mr-3 select-none w-6 text-right flex-shrink-0">{i + 1}</span>
+                <span className={
+                  line.includes('ERROR') || line.includes('error') || line.includes('Failed')
+                    ? 'text-rose-400'
+                    : line.includes('WARN') || line.includes('warning')
+                    ? 'text-amber-300'
+                    : line.includes('INFO')
+                    ? 'text-sky-300'
+                    : line.includes('[✓]') || line.includes('Started') || line.includes('ready')
+                    ? 'text-emerald-400'
+                    : 'text-slate-300'
+                }>
+                  {line}
+                </span>
+              </div>
+            ))
+          ) : (
+            <div className="text-slate-500 italic py-8 text-center">
+              {logsLoading ? 'Streaming systemd journal output…' : 'No log lines captured yet.'}
             </div>
-          ))}
+          )}
         </div>
       </div>
     </div>
