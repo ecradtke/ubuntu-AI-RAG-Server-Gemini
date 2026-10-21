@@ -1,0 +1,8 @@
+{
+  "title": "A Gaza war documentary sparks outrage in Israel",
+  "url": "https://www.npr.org/2026/10/15/nx-s1-6003972/a-gaza-war-documentary-sparks-outrage-in-israel",
+  "feed": "#war",
+  "group": "personal",
+  "published_at": 1792096781,
+  "text": "A Gaza war documentary sparks outrage in Israel"
+}
