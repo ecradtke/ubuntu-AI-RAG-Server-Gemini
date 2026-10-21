@@ -24,4 +24,5 @@ export default defineConfig({
       },
     },
   },
+  envPrefix: ['VITE_', 'RAG_', 'MAX_', 'TOP_', 'DEFAULT_', 'LLM_', 'EMBED_', 'OV_', 'QDRANT_'],
 });

@@ -12,6 +12,8 @@ import { K13Client } from './services/k13Client';
 
 const defaultHost = typeof window !== 'undefined' && window.location.hostname ? window.location.hostname : '127.0.0.1';
 
+const envBudget = Number((import.meta as any).env?.RAG_CONTEXT_TOKEN_BUDGET || (import.meta as any).env?.VITE_RAG_CONTEXT_TOKEN_BUDGET) || 8000;
+
 const INITIAL_CONFIG: ClusterConfig = {
   connectionMode: 'live',
   inferenceUrl: `http://${defaultHost}:11434`,
@@ -23,7 +25,7 @@ const INITIAL_CONFIG: ClusterConfig = {
   llmHardware: 'GPU',
   embedHardware: 'NPU',
   topK: 6,
-  ragContextTokenBudget: 8000,
+  ragContextTokenBudget: envBudget,
   persona: 'Objective News Analyst',
   feedFilter: '(All Feeds)',
   groupFilter: '(All Groups)',

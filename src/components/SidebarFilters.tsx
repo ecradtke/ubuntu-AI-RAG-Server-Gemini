@@ -162,6 +162,53 @@ export const SidebarFilters: React.FC<SidebarFiltersProps> = ({
           </div>
         </div>
 
+        {/* Excerpt Token Allowance (Context Budget) */}
+        <div className="space-y-2 pt-2 border-t border-slate-800/80">
+          <div className="flex items-center justify-between text-xs">
+            <span className="font-medium text-slate-300">Excerpt Token Allowance</span>
+            <span className="font-mono px-2 py-0.5 rounded bg-slate-900 border border-slate-800 text-sky-300 font-semibold">
+              {(config.ragContextTokenBudget / 1000).toFixed(0)}K ({config.ragContextTokenBudget.toLocaleString()} tok)
+            </span>
+          </div>
+          <input
+            type="range"
+            min={2000}
+            max={32000}
+            step={1000}
+            value={config.ragContextTokenBudget}
+            onChange={e => onUpdateConfig({ ragContextTokenBudget: parseInt(e.target.value) || 8000 })}
+            className="w-full accent-sky-500 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
+          />
+          {/* Quick presets */}
+          <div className="flex items-center gap-1.5">
+            {[4000, 8000, 16000, 20000, 32000].map(budget => (
+              <button
+                key={budget}
+                type="button"
+                onClick={() => onUpdateConfig({ ragContextTokenBudget: budget })}
+                className={`flex-1 py-1 rounded text-[10px] font-mono font-medium transition ${
+                  config.ragContextTokenBudget === budget
+                    ? 'bg-sky-600 text-white font-bold shadow'
+                    : 'bg-slate-900 text-slate-400 hover:text-slate-200 border border-slate-800'
+                }`}
+              >
+                {budget / 1000}K
+              </button>
+            ))}
+          </div>
+          <div className="text-[11px] text-slate-400">
+            {config.ragContextTokenBudget >= 20000 ? (
+              <span className="text-sky-300">
+                ⚡ 20K+ High Allowance: ~{((config.ragContextTokenBudget * 3.5) / 1000).toFixed(0)}KB context. High recall across dozens of articles.
+              </span>
+            ) : (
+              <span>
+                Standard budget (~{((config.ragContextTokenBudget * 3.5) / 1000).toFixed(0)}KB context).
+              </span>
+            )}
+          </div>
+        </div>
+
         {/* Persona */}
         <div className="mt-4">
           <label className="block text-xs font-medium text-slate-300 mb-1">

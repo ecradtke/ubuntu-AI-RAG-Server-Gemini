@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Settings, Shield, HardDrive, Terminal, FileCode, Check, Copy, Globe, RefreshCw } from 'lucide-react';
+import { Settings, Shield, HardDrive, Terminal, FileCode, Check, Copy, Globe, RefreshCw, Zap, Cpu, AlertTriangle, Layers, BookOpen } from 'lucide-react';
 import { ClusterConfig } from '../types';
 
 interface ConfigViewProps {
@@ -265,6 +265,119 @@ export const ConfigView: React.FC<ConfigViewProps> = ({ config, onUpdateConfig }
             </div>
           </div>
         )}
+      </div>
+
+      {/* Token Allowance & GPU VRAM Engineering Card */}
+      <div className="p-5 rounded-2xl bg-slate-900/80 border border-slate-800 shadow-xl space-y-5">
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <div className="flex items-center gap-2">
+            <Zap className="w-5 h-5 text-amber-400" />
+            <span className="font-bold text-slate-100 text-sm">Excerpt Token Allowance & VRAM Engineering</span>
+          </div>
+          <span className="px-3 py-1 rounded-full text-xs font-mono font-semibold bg-sky-950 border border-sky-700/60 text-sky-300">
+            Active Budget: {config.ragContextTokenBudget.toLocaleString()} tokens (~{((config.ragContextTokenBudget * 3.5) / 1000).toFixed(0)}KB text)
+          </span>
+        </div>
+
+        <p className="text-xs text-slate-300 leading-relaxed">
+          The excerpt token allowance controls the maximum context size allocated to retrieved Qdrant articles when assembling the prompt for the OpenVINO LLM. Increasing this allowance to <strong>20,000 tokens</strong> provides deep multi-document synthesis across dozens of full-length news reports.
+        </p>
+
+        {/* Quick UI Preset Switcher */}
+        <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
+          <div className="flex items-center justify-between text-xs">
+            <span className="font-medium text-slate-300 flex items-center gap-1.5">
+              <Layers className="w-4 h-4 text-sky-400" />
+              <span>Interactive Excerpt Budget Selector</span>
+            </span>
+            <span className="font-mono text-indigo-300 font-semibold">{config.ragContextTokenBudget.toLocaleString()} tokens</span>
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+            {[4000, 8000, 16000, 20000, 32000].map(budget => (
+              <button
+                key={budget}
+                type="button"
+                onClick={() => onUpdateConfig({ ragContextTokenBudget: budget })}
+                className={`py-2 px-3 rounded-lg text-xs font-mono transition text-center ${
+                  config.ragContextTokenBudget === budget
+                    ? 'bg-sky-600 text-white font-bold ring-2 ring-sky-400/50 shadow-lg'
+                    : 'bg-slate-900 text-slate-300 hover:bg-slate-850 hover:text-white border border-slate-800'
+                }`}
+              >
+                <div className="text-sm font-bold">{budget / 1000}K</div>
+                <div className="text-[10px] opacity-75">{budget.toLocaleString()} tok</div>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* How to configure 20K in .env */}
+        <div className="p-4 rounded-xl bg-slate-950 border border-sky-900/40 text-xs space-y-2">
+          <div className="font-semibold text-sky-300 flex items-center gap-1.5">
+            <BookOpen className="w-4 h-4 text-sky-400" />
+            <span>How to set Excerpt Allowance to 20K permanently in .env</span>
+          </div>
+          <p className="text-slate-300 text-xs">
+            Edit your root <code>.env</code> file (following the single-line comment rule, no inline comments):
+          </p>
+          <pre className="p-3 rounded-lg bg-slate-900 border border-slate-800 font-mono text-[11px] text-sky-200 overflow-x-auto">
+{`# Max token budget for retrieved Qdrant excerpts
+RAG_CONTEXT_TOKEN_BUDGET=20000
+
+# Recommended: allow up to 100-150 excerpts retrieval in the UI
+TOP_K_MAX=150`}
+          </pre>
+          <p className="text-slate-400 text-[11px]">
+            Then restart the web portal service to pick up the updated environment variable:
+            <code className="ml-1 px-1.5 py-0.5 rounded bg-slate-900 text-indigo-300 font-mono">sudo systemctl restart k13-web</code>
+          </p>
+        </div>
+
+        {/* Hardware & GPU VRAM KV Cache Table */}
+        <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 text-xs space-y-3">
+          <div className="font-semibold text-slate-200 flex items-center gap-1.5">
+            <Cpu className="w-4 h-4 text-emerald-400" />
+            <span>Hardware Topology & KV Cache Memory Impact (6.8 GB Intel GPU VRAM Ceiling)</span>
+          </div>
+          <p className="text-slate-400 text-xs">
+            On the native Ubuntu Server host, the Intel Lunar Lake / Arc GPU runtime caps at <strong>~6.8 GB VRAM</strong>. Context tokens consume GPU memory via the Key-Value (KV) Cache:
+          </p>
+          <div className="overflow-x-auto border border-slate-800 rounded-lg">
+            <table className="w-full text-left font-mono text-[11px]">
+              <thead className="bg-slate-900 text-slate-400 border-b border-slate-800 font-sans">
+                <tr>
+                  <th className="p-2">Model (INT4)</th>
+                  <th className="p-2">Model Weights</th>
+                  <th className="p-2">KV Cache (8K Context)</th>
+                  <th className="p-2">KV Cache (20K Context)</th>
+                  <th className="p-2">20K GPU Status</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800/80 text-slate-300">
+                <tr>
+                  <td className="p-2 text-sky-300 font-bold">Phi-3.5-mini (3.8B)</td>
+                  <td className="p-2">~2.3 GB</td>
+                  <td className="p-2">~0.55 GB</td>
+                  <td className="p-2 text-emerald-400 font-semibold">~1.38 GB</td>
+                  <td className="p-2 text-emerald-400 font-bold">✓ ~3.7 GB (Plenty of headroom)</td>
+                </tr>
+                <tr>
+                  <td className="p-2 text-sky-300 font-bold">Qwen3-8B-int4</td>
+                  <td className="p-2">~4.8 GB</td>
+                  <td className="p-2">~1.05 GB</td>
+                  <td className="p-2 text-amber-400 font-semibold">~2.65 GB</td>
+                  <td className="p-2 text-amber-300 font-bold">⚠️ ~7.45 GB (Requires SWITCH_ALLOW_CPU=on)</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div className="flex items-start gap-2 text-amber-300/90 text-[11px] bg-amber-950/30 p-2.5 rounded-lg border border-amber-800/40">
+            <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+            <span>
+              <strong>Crucial Architecture Tip:</strong> If running 20K context with the 8B model, set <code className="text-amber-200">SWITCH_ALLOW_CPU=on</code> in <code className="text-amber-200">.env</code> so OpenVINO gracefully offloads or manages KV cache overflow without crashing, OR switch to <strong>Phi-3.5-mini-instruct</strong> for lightning-fast 20K context on pure GPU!
+            </span>
+          </div>
+        </div>
       </div>
 
       {/* Environment Variables Table */}

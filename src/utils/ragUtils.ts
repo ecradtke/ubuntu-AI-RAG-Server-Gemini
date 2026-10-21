@@ -62,14 +62,20 @@ export function buildContext(
     return { contextText: '', usedCount: 0, charsPerExcerpt: EXCERPT_MAX_CHARS, wasTrimmed: false };
   }
 
-  for (const limit of [EXCERPT_MAX_CHARS, 240, 190, 150, 120, 100]) {
+  // Allow richer excerpts when the token budget is expanded (e.g. 20,000 tokens)
+  const maxLimit = Math.max(EXCERPT_MAX_CHARS, Math.min(1800, Math.floor(budgetChars / n)));
+  const limits = [maxLimit, 1200, 800, 500, EXCERPT_MAX_CHARS, 240, 190, 150, 120, 100].filter(
+    (v, idx, arr) => arr.indexOf(v) === idx && v <= maxLimit
+  );
+
+  for (const limit of limits) {
     const text = render(n, limit);
     if (text.length <= budgetChars) {
       return {
         contextText: text,
         usedCount: n,
         charsPerExcerpt: limit,
-        wasTrimmed: limit < EXCERPT_MAX_CHARS
+        wasTrimmed: limit < maxLimit
       };
     }
   }
