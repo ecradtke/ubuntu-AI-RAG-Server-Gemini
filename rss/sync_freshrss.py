@@ -21,6 +21,8 @@ Pipeline Workflow:
 import os
 import sys
 import time
+import datetime
+from datetime import timezone
 import uuid
 import re
 import logging
@@ -901,10 +903,31 @@ def main():
                         col_dict[table_info["content_col"]] = it["text"]
                     if table_info["group_col"] and table_info["group_col"] in cols:
                         col_dict[table_info["group_col"]] = it["group"]
+                    # Convert published_at to appropriate data type (timestamptz vs bigint/int)
                     if table_info["pub_col"] and table_info["pub_col"] in cols:
-                        col_dict[table_info["pub_col"]] = it["published_at"]
+                        pub_epoch = it.get("published_at") or int(time.time())
+                        if isinstance(pub_epoch, (int, float)):
+                            if pub_epoch > 100000000000:
+                                pub_epoch = pub_epoch / 1000.0
+                            if pub_epoch <= 0:
+                                pub_epoch = time.time()
+                        else:
+                            pub_epoch = time.time()
+
+                        pub_dtype = table_info["col_types"].get(table_info["pub_col"], "")
+                        if "timestamp" in pub_dtype or "date" in pub_dtype:
+                            col_dict[table_info["pub_col"]] = datetime.datetime.fromtimestamp(pub_epoch, tz=timezone.utc)
+                        else:
+                            col_dict[table_info["pub_col"]] = int(pub_epoch)
+
+                    # Convert fetched_at to appropriate data type (timestamptz vs bigint/int)
                     if table_info["fetched_at_col"] and table_info["fetched_at_col"] in cols:
-                        col_dict[table_info["fetched_at_col"]] = int(time.time())
+                        fetched_dtype = table_info["col_types"].get(table_info["fetched_at_col"], "")
+                        if "timestamp" in fetched_dtype or "date" in fetched_dtype:
+                            col_dict[table_info["fetched_at_col"]] = datetime.datetime.now(timezone.utc)
+                        else:
+                            col_dict[table_info["fetched_at_col"]] = int(time.time())
+
                     if table_info["vector_indexed_col"] and table_info["vector_indexed_col"] in cols:
                         col_dict[table_info["vector_indexed_col"]] = False
 
@@ -1124,7 +1147,6 @@ def main():
     # Mark both already-indexed articles and newly-embedded articles as read!
     all_to_mark = list(set(already_indexed_freshrss_ids + newly_embedded_freshrss_ids))
     if api_base and auth_token and all_to_mark:
-        logger.info(f"Marking {len(all_to_mark)} articles as READ in FreshRSS server API...")
         mark_freshrss_items_read(api_base, auth_token, csrf_token, all_to_mark)
     elif api_base and auth_token and not all_to_mark:
         logger.info("No unread articles pending mark-as-read.")
