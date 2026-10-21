@@ -378,6 +378,72 @@ TOP_K_MAX=150`}
             </span>
           </div>
         </div>
+
+        {/* GMKtec K13 Lunar Lake Core Ultra 7 256V Hardware Evaluation */}
+        <div className="p-4 rounded-xl bg-slate-950 border border-indigo-900/40 text-xs space-y-4">
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div className="font-semibold text-indigo-300 flex items-center gap-1.5 text-sm">
+              <Cpu className="w-4 h-4 text-indigo-400" />
+              <span>GMKtec K13 (Core Ultra 7 256V) Architecture: Can We Swap LLM to NPU?</span>
+            </div>
+            <span className="px-2.5 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-rose-950 border border-rose-700/60 text-rose-300">
+              Verdict: Not Recommended
+            </span>
+          </div>
+
+          <p className="text-slate-300 text-xs leading-relaxed">
+            The GMKtec K13 is powered by Intel&apos;s <strong>Lunar Lake</strong> platform (Core Ultra 7 256V). The &ldquo;6&rdquo; in 256V signifies <strong>16 GB LPDDR5X-8533 Memory-on-Package (MoP)</strong>, physically integrated onto the processor die. Here is why swapping the LLM to the NPU will not bypass the memory limit:
+          </p>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div className="p-3 rounded-lg bg-slate-900 border border-slate-800 space-y-2">
+              <div className="font-semibold text-sky-300 flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-sky-400" />
+                <span>1. Unified Memory Reality</span>
+              </div>
+              <p className="text-[11px] text-slate-400 leading-relaxed">
+                The NPU does <strong>not</strong> have dedicated private memory. On Lunar Lake, the <strong>CPU, Arc 140V GPU, and NPU 4 all share the same 16 GB physical pool</strong>. The ~6.8 GB limit on the GPU is an OS/driver allocation policy, not physical VRAM separation. Both GPU and NPU draw from the same ~13 GB usable system RAM.
+              </p>
+            </div>
+
+            <div className="p-3 rounded-lg bg-slate-900 border border-slate-800 space-y-2">
+              <div className="font-semibold text-amber-300 flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-amber-400" />
+                <span>2. Dynamic Shapes & 20K Context</span>
+              </div>
+              <p className="text-[11px] text-slate-400 leading-relaxed">
+                The Intel NPU compiler requires <strong>static shapes</strong> (e.g. <code>bge-base</code> at <code>(1, 512)</code>). Generative LLMs require dynamic auto-regressive decoding. Compiling an LLM for 20K tokens on the NPU produces multi-gigabyte static graph blobs, prohibitive compilation times, and very high prompt prefill latency.
+              </p>
+            </div>
+
+            <div className="p-3 rounded-lg bg-slate-900 border border-slate-800 space-y-2">
+              <div className="font-semibold text-purple-300 flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-purple-400" />
+                <span>3. Memory Bandwidth & TTFT</span>
+              </div>
+              <p className="text-[11px] text-slate-400 leading-relaxed">
+                The Arc 140V GPU features 8 Xe2 cores and 8MB Sideband Cache optimized for high-bandwidth matrix multiplication. Time-To-First-Token (TTFT) on a 20,000-token prompt on the GPU takes ~2–4 seconds, while NPU prefill for long sequences is significantly slower.
+              </p>
+            </div>
+
+            <div className="p-3 rounded-lg bg-slate-900 border border-slate-800 space-y-2">
+              <div className="font-semibold text-emerald-300 flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                <span>4. Resource Contention with BGE</span>
+              </div>
+              <p className="text-[11px] text-slate-400 leading-relaxed">
+                In the K13 architecture, the NPU is already 100% dedicated to <code>BAAI/bge-base-en-v1.5</code> (768d) for continuous search & the 5-minute <code>k13-rss-sync</code> timer. Moving the LLM to the NPU causes device contention and eviction on <code>/dev/accel/accel0</code>.
+              </p>
+            </div>
+          </div>
+
+          <div className="p-3 rounded-lg bg-emerald-950/40 border border-emerald-800/50 text-[11px] text-emerald-200 space-y-1">
+            <span className="font-bold text-emerald-300 block">Recommended Architecture for 20K Excerpts on K13:</span>
+            <span>• Keep <strong>Phi-3.5-mini-instruct-int4-ov</strong> on the <strong>GPU</strong> (only ~3.7 GB total VRAM with 20K context).</span><br />
+            <span>• Keep <strong>bge-base-en-v1.5</strong> on the <strong>NPU</strong> (static shape 1, 512, zero GPU memory footprint).</span><br />
+            <span>• If using <strong>Qwen3-8B</strong> with 20K tokens, set <code>SWITCH_ALLOW_CPU=on</code> in <code>.env</code> to allow safe system RAM spilling.</span>
+          </div>
+        </div>
       </div>
 
       {/* Environment Variables Table */}
